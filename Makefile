@@ -6,7 +6,7 @@
         test-entra-node test-entra-node-local \
         test-apim-java \
         test-cosmos test-cosmos-mongo test-cosmos-postgresql test-cosmos-cassandra test-cosmos-gremlin test-cosmos-table test-cosmos-nosql test-cosmos-all \
-        test-sql test-mysql test-mariadb test-terraform-compat test-opentofu-compat test-azcli test-iac-compat compat-docker test-compat clean
+        test-sql test-mysql test-mariadb test-aci-compat test-terraform-compat test-opentofu-compat test-azcli test-iac-compat compat-docker test-compat clean
 
 MVN            = ./mvnw
 PORT           = 4577
@@ -248,6 +248,10 @@ test-node-compat-local:
 test-servicebus-compat:
 	@echo "==> Service Bus Java SDK compatibility tests"
 	cd $(JAVA_DIR) && mvn test -Dtest=ServiceBusCompatibilityTest -q
+
+test-aci-compat:
+	@echo "==> Container Instances Java SDK compatibility tests"
+	cd $(JAVA_DIR) && mvn test -Dtest=ContainerInstanceCompatibilityTest -q
 
 # ── Blob compatibility subset ─────────────────────────────────────────────────
 

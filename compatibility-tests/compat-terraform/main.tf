@@ -344,3 +344,58 @@ output "nsg_id" {
 output "application_gateway_id" {
   value = azurerm_application_gateway.agw.id
 }
+
+resource "azurerm_container_group" "aci" {
+  name                = "floci-test-aci-tf"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  ip_address_type     = "Public"
+  dns_name_label      = "floci-test-aci-tf"
+  os_type             = "Linux"
+  restart_policy      = "Always"
+
+  container {
+    name   = "web"
+    image  = "alpine:3.20"
+    cpu    = "1"
+    memory = "1"
+
+    commands = ["sh", "-c", "while true; do echo hello-from-terraform; sleep 2; done"]
+
+    ports {
+      port     = 8080
+      protocol = "TCP"
+    }
+
+    environment_variables = {
+      GREETING = "hello"
+    }
+
+    secure_environment_variables = {
+      API_TOKEN = "s3cr3t-token"
+    }
+
+    volume {
+      name       = "scratch-volume"
+      mount_path = "/mnt/scratch"
+      read_only  = false
+      empty_dir  = true
+    }
+  }
+
+  tags = {
+    suite = "compat-terraform"
+  }
+}
+
+output "aci_id" {
+  value = azurerm_container_group.aci.id
+}
+
+output "aci_fqdn" {
+  value = azurerm_container_group.aci.fqdn
+}
+
+output "aci_ip_address" {
+  value = azurerm_container_group.aci.ip_address
+}

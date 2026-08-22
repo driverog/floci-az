@@ -29,6 +29,8 @@ export NIC_NAME="floci-test-nic"
 export VM_NAME="floci-test-vm"
 export ACR_NAME="flocitestacr"
 export REDIS_NAME="floci-test-redis"
+export ACI_NAME="floci-test-aci"
+export ACI_DNS_LABEL="floci-test-aci-dns"
 
 # Dev storage key (well-known Azurite key floci-az accepts) — used to build a
 # data-plane connection string, mirroring azfloci/azfloci.py.

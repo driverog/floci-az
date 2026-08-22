@@ -203,3 +203,24 @@ setup() {
     assert_output --partial "Running"
     assert_output --partial "Succeeded"
 }
+
+@test "OpenTofu: container group created" {
+    cd "$TOFU_DIR"
+    run tofu output -raw aci_id
+    assert_success
+    assert_output --partial "/providers/Microsoft.ContainerInstance/containerGroups/floci-test-aci-tf"
+}
+
+@test "OpenTofu: container group FQDN follows the Azure format" {
+    cd "$TOFU_DIR"
+    run tofu output -raw aci_fqdn
+    assert_success
+    assert_output "floci-test-aci-tf.eastus.azurecontainer.io"
+}
+
+@test "OpenTofu: container group has an IP address" {
+    cd "$TOFU_DIR"
+    run tofu output -raw aci_ip_address
+    assert_success
+    refute_output ""
+}

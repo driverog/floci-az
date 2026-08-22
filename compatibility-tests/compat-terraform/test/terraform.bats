@@ -189,3 +189,24 @@ setup() {
     assert_output --partial "Running"
     assert_output --partial "Succeeded"
 }
+
+@test "Terraform: container group created" {
+    cd "$TF_DIR"
+    run terraform output -raw aci_id
+    assert_success
+    assert_output --partial "/providers/Microsoft.ContainerInstance/containerGroups/floci-test-aci-tf"
+}
+
+@test "Terraform: container group FQDN follows the Azure format" {
+    cd "$TF_DIR"
+    run terraform output -raw aci_fqdn
+    assert_success
+    assert_output "floci-test-aci-tf.eastus.azurecontainer.io"
+}
+
+@test "Terraform: container group has an IP address" {
+    cd "$TF_DIR"
+    run terraform output -raw aci_ip_address
+    assert_success
+    refute_output ""
+}
