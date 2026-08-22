@@ -171,6 +171,31 @@ class ContainerInstanceHandlerTest {
                 .body("error.code", equalTo("ResourceNotFound"));
     }
 
+    /**
+     * A body that is present but does not parse reaches the handler as a null node. PUT rejects
+     * it through validation rule V2; PATCH used to dereference it and answer 500.
+     */
+    @Test
+    void patchMalformedBodyReturns400() {
+        create("demo-group", FULL);
+        given().contentType("application/json").body("{\"tags\": ")
+                .when().patch(groupUrl("demo-group"))
+                .then().statusCode(400)
+                .body("error.code", equalTo("InvalidRequestContent"));
+    }
+
+    /** A malformed body must not have replaced the tags on its way to the error. */
+    @Test
+    void patchMalformedBodyLeavesTagsIntact() {
+        create("demo-group", FULL);
+        given().contentType("application/json").body("not json at all")
+                .when().patch(groupUrl("demo-group"))
+                .then().statusCode(400);
+        given().when().get(groupUrl("demo-group"))
+                .then().statusCode(200)
+                .body("tags.env", equalTo("test"));
+    }
+
     @Test
     void deleteReturns204AndIsIdempotent() {
         create("demo-group", MINIMAL);

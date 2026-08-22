@@ -40,6 +40,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * HTTP handler for Azure Container Instances
@@ -240,6 +243,30 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
 
     // ── CRUD ───────────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Runs {@code action} against the group, holding the group's lock and reading the record
+     * <em>inside</em> it.
+     *
+     * <p>This is the whole mutation protocol, in one place. Reading before the lock and writing
+     * the result back after it silently discards whatever the reconciler — or another request —
+     * persisted in between: the reconciler's own tick re-reads under the lock for exactly this
+     * reason, and every mutating path here has to do the same. Routing the paths through this
+     * method makes that structural rather than a convention each new call site can forget.</p>
+     *
+     * <p>{@code absent} supplies the response when the group is gone by the time the lock is
+     * held, which a concurrent {@code DELETE} makes reachable.</p>
+     */
+    private Response withGroupLocked(String key, Function<ContainerGroup, Response> action,
+                                     Supplier<Response> absent) {
+        ReentrantLock lock = runtime.lockFor(key);
+        lock.lock();
+        try {
+            return read(key).map(action).orElseGet(absent);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private Response handleCreateOrUpdate(String sub, String rg, String name, AzureRequest req) {
         JsonNode body = readBody(req.bodyStream());
         Optional<Response> invalid = validator.validate(name, body);
@@ -248,41 +275,44 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
         }
 
         String key = storageKey(sub, rg, name);
-        Optional<ContainerGroup> existing = read(key);
-        boolean isNew = existing.isEmpty();
+        ReentrantLock lock = runtime.lockFor(key);
+        lock.lock();
+        try {
+            // Read under the lock. A reconciler repair landing between an unlocked read and the
+            // lock would be torn down from a stale snapshot, leaving the containers it had just
+            // created running and referenced by nothing.
+            Optional<ContainerGroup> existing = read(key);
+            boolean isNew = existing.isEmpty();
 
-        ContainerGroup group = new ContainerGroup();
-        group.setSubscriptionId(sub);
-        group.setResourceGroup(rg);
-        group.setName(name);
-        group.setGroupId(existing.map(ContainerGroup::getGroupId).orElseGet(ContainerInstanceHandler::newGroupId));
-        group.setTimeCreated(existing.map(ContainerGroup::getTimeCreated).orElseGet(Instant::now));
+            ContainerGroup group = new ContainerGroup();
+            group.setSubscriptionId(sub);
+            group.setResourceGroup(rg);
+            group.setName(name);
+            group.setGroupId(existing.map(ContainerGroup::getGroupId).orElseGet(ContainerInstanceHandler::newGroupId));
+            group.setTimeCreated(existing.map(ContainerGroup::getTimeCreated).orElseGet(Instant::now));
 
-        JsonNode locationNode = body.get("location");
-        String location = locationNode != null && locationNode.isTextual() && !locationNode.asText().isBlank()
-                ? locationNode.asText()
-                : config.services().containerInstance().defaultLocation();
-        group.setLocation(location);
-        group.setTags(parseTags(body.get("tags")));
-        group.setZones(parseStringList(body.get("zones")));
-        group.setIdentity(resolveIdentity(body.get("identity"),
-                existing.map(ContainerGroup::getIdentity).orElse(null)));
+            JsonNode locationNode = body.get("location");
+            String location = locationNode != null && locationNode.isTextual() && !locationNode.asText().isBlank()
+                    ? locationNode.asText()
+                    : config.services().containerInstance().defaultLocation();
+            group.setLocation(location);
+            group.setTags(parseTags(body.get("tags")));
+            group.setZones(parseStringList(body.get("zones")));
+            group.setIdentity(resolveIdentity(body.get("identity"),
+                    existing.map(ContainerGroup::getIdentity).orElse(null)));
 
-        GroupSecrets secrets = extractSecrets(body.get("properties"));
-        Map<String, Object> properties = redactSecrets(stripReadOnly(objectToMap(body.get("properties"))));
-        group.setProperties(properties);
-        group.setRestartPolicy(RestartPolicy.fromWire(String.valueOf(properties.get("restartPolicy"))));
-        properties.put("restartPolicy", group.getRestartPolicy().wire());
-        group.setContainers(buildContainerRecords(properties));
-        group.setIpAddress("127.0.0.1");
-        group.setFqdn(resolveFqdn(properties, group));
+            GroupSecrets secrets = extractSecrets(body.get("properties"));
+            Map<String, Object> properties = redactSecrets(stripReadOnly(objectToMap(body.get("properties"))));
+            group.setProperties(properties);
+            group.setRestartPolicy(RestartPolicy.fromWire(String.valueOf(properties.get("restartPolicy"))));
+            properties.put("restartPolicy", group.getRestartPolicy().wire());
+            group.setContainers(buildContainerRecords(properties));
+            group.setIpAddress("127.0.0.1");
+            group.setFqdn(resolveFqdn(properties, group));
 
-        if (mocked()) {
-            provisionMocked(group);
-        } else {
-            java.util.concurrent.locks.ReentrantLock lock = runtime.lockFor(key);
-            lock.lock();
-            try {
+            if (mocked()) {
+                provisionMocked(group);
+            } else {
                 // A PUT on an existing group replaces it: ACI has no in-place container mutation.
                 // The published host ports carry over so a client's connection details survive.
                 existing.ifPresent(previous -> {
@@ -297,20 +327,15 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
                     }
                 });
                 provisionWithDocker(group, secrets, key);
-                write(key, group);
-            } finally {
-                lock.unlock();
             }
+            write(key, group);
             return Response.status(isNew ? 201 : 200)
                     .entity(toArmResponse(group, true))
                     .type("application/json")
                     .build();
+        } finally {
+            lock.unlock();
         }
-        write(key, group);
-        return Response.status(isNew ? 201 : 200)
-                .entity(toArmResponse(group, true))
-                .type("application/json")
-                .build();
     }
 
     /** Mocked-mode provisioning: everything is immediately up, with no Docker call. */
@@ -444,23 +469,27 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
     }
 
     private Response handleUpdateTags(String sub, String rg, String name, AzureRequest req) {
-        String key = storageKey(sub, rg, name);
-        Optional<ContainerGroup> found = read(key);
-        if (found.isEmpty()) {
-            return ContainerInstanceErrors.groupNotFound(name, rg);
+        JsonNode body = readBody(req.bodyStream());
+        if (body == null || !body.isObject()) {
+            // readBody yields null for a body that is present but does not parse. PUT rejects
+            // that through validation rule V2; PATCH has to answer the same way rather than
+            // dereference the null and hand the client a 500.
+            return ContainerInstanceErrors.bodyNotAnObject();
         }
-        ContainerGroup group = found.get();
-        // ContainerGroups_Update's request body is a bare Resource: it carries no `properties`,
-        // so anything sent there is ignored and the tag collection is replaced wholesale.
-        group.setTags(parseTags(readBody(req.bodyStream()).get("tags")));
-        write(key, group);
-        return Response.ok(toArmResponse(group, true)).type("application/json").build();
+        String key = storageKey(sub, rg, name);
+        return withGroupLocked(key, group -> {
+            // ContainerGroups_Update's request body is a bare Resource: it carries no `properties`,
+            // so anything sent there is ignored and the tag collection is replaced wholesale.
+            group.setTags(parseTags(body.get("tags")));
+            write(key, group);
+            return Response.ok(toArmResponse(group, true)).type("application/json").build();
+        }, () -> ContainerInstanceErrors.groupNotFound(name, rg));
     }
 
     private Response handleDelete(String sub, String rg, String name) {
         String key = storageKey(sub, rg, name);
         if (!mocked()) {
-            java.util.concurrent.locks.ReentrantLock lock = runtime.lockFor(key);
+            ReentrantLock lock = runtime.lockFor(key);
             lock.lock();
             try {
                 read(key).filter(group -> !group.isDegraded()).ifPresent(group -> {
@@ -472,10 +501,13 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
                     }
                 });
                 storage.delete(key);
+                // Custody is released inside the critical section that drops the record. Doing it
+                // after the unlock lets a replacement PUT take the lock, register its own secrets
+                // and then have them forgotten by this call.
+                runtime.forgetSecrets(key);
             } finally {
                 lock.unlock();
             }
-            runtime.forgetSecrets(key);
             return Response.status(204).build();
         }
         // 204 rather than 202: the azurerm provider's DeleteThenPoll would otherwise poll the
@@ -508,45 +540,35 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
 
     private Response handleAction(String sub, String rg, String name, String action) {
         String key = storageKey(sub, rg, name);
-        Optional<ContainerGroup> found = read(key);
-        if (found.isEmpty()) {
-            return ContainerInstanceErrors.groupNotFound(name, rg);
-        }
-        ContainerGroup group = found.get();
-        boolean pureState = mocked() || group.isDegraded();
-        if (pureState) {
-            applyActionState(group, action, true);
-            write(key, group);
-            return Response.status(204).build();
-        }
-        java.util.concurrent.locks.ReentrantLock lock = runtime.lockFor(key);
-        lock.lock();
-        try {
-            try {
-                switch (action) {
-                    case "stop"  -> runtime.stopGroup(group);
-                    case "start" -> runtime.startGroup(group);
-                    default      -> runtime.restartGroup(group);
+        return withGroupLocked(key, group -> {
+            boolean pureState = mocked() || group.isDegraded();
+            if (!pureState) {
+                try {
+                    switch (action) {
+                        case "stop"  -> runtime.stopGroup(group);
+                        case "start" -> runtime.startGroup(group);
+                        default      -> runtime.restartGroup(group);
+                    }
+                    if (!"stop".equals(action)) {
+                        // A restarted namespace owner may come back on a different container IP,
+                        // so the address the group advertises has to be re-read rather than
+                        // carried over.
+                        runtime.refreshGroupIp(group);
+                    }
+                } catch (Exception e) {
+                    // Non-fatal, mirroring the VM handler: the control-plane state still
+                    // transitions so the client's view stays consistent, and the reconciler
+                    // corrects it later.
+                    LOG.warnv("Action {0} on container group {1} failed: {2}",
+                            action, name, e.getMessage());
                 }
-                if (!"stop".equals(action)) {
-                    // A restarted namespace owner may come back on a different container IP, so
-                    // the address the group advertises has to be re-read rather than carried over.
-                    runtime.refreshGroupIp(group);
-                }
-            } catch (Exception e) {
-                // Non-fatal, mirroring the VM handler: the control-plane state still transitions
-                // so the client's view stays consistent, and the reconciler corrects it later.
-                LOG.warnv("Action {0} on container group {1} failed: {2}",
-                        action, name, e.getMessage());
             }
-            applyActionState(group, action, false);
+            applyActionState(group, action, pureState);
             write(key, group);
-        } finally {
-            lock.unlock();
-        }
-        // Terminal, with no Azure-AsyncOperation / Location / Retry-After header: the emulator
-        // completes every operation synchronously.
-        return Response.status(204).build();
+            // Terminal, with no Azure-AsyncOperation / Location / Retry-After header: the
+            // emulator completes every operation synchronously.
+            return Response.status(204).build();
+        }, () -> ContainerInstanceErrors.groupNotFound(name, rg));
     }
 
     private void applyActionState(ContainerGroup group, String action, boolean pureState) {
@@ -1075,10 +1097,13 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
                 if (group.isDegraded()) {
                     continue;
                 }
-                java.util.concurrent.locks.ReentrantLock lock = runtime.lockFor(group.storageKey());
+                ReentrantLock lock = runtime.lockFor(group.storageKey());
                 lock.lock();
                 try {
-                    runtime.destroyGroup(group);
+                    // Re-read under the lock, as every other mutating path does: the scan
+                    // snapshot can name containers a reconciler repair has since replaced, and
+                    // tearing those down would leave the live ones behind.
+                    runtime.destroyGroup(read(group.storageKey()).orElse(group));
                 } catch (Exception e) {
                     LOG.warnv("Reset: failed to remove Docker resources for container group "
                             + "{0}: {1}", group.getName(), e.getMessage());
