@@ -295,6 +295,11 @@ public class ContainerGroupReconciler {
         if (group.getRestartPolicy() == RestartPolicy.ALWAYS) {
             return GroupStateValue.RUNNING;
         }
+        // G8: OnFailure restarts a container that exited nonzero, so the group is not terminal
+        // either — it is between restarts. Only Never lets a nonzero exit settle into Failed (G7).
+        if (anyNonZero && group.getRestartPolicy() == RestartPolicy.ON_FAILURE) {
+            return GroupStateValue.RUNNING;
+        }
         return anyNonZero ? GroupStateValue.FAILED : GroupStateValue.SUCCEEDED;
     }
 
