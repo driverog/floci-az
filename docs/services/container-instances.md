@@ -24,8 +24,9 @@ different one.
 
 ## Features
 
-- **Lifecycle** — CreateOrUpdate, Get (with `?$expand=instanceView`), UpdateTags, Delete,
-  List by resource group and by subscription
+- **Lifecycle** — CreateOrUpdate, Get, UpdateTags, Delete, List by resource group and by
+  subscription. `instanceView` is returned on every single-resource response; `$expand` is
+  accepted and ignored
 - **Actions** — `start`, `stop`, `restart`, all synchronous and terminal
 - **Logs** — `GET .../containers/{container}/logs` with `tail` and `timestamps`, bounded by the
   configured byte and line caps

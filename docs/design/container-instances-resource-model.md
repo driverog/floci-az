@@ -308,8 +308,12 @@ present in a list response — matching the swagger's `ListResultContainerGroup`
 >   [global-parameters table](#global-parameters), transcribed from the swagger, lists only
 >   `subscriptionId`, `resourceGroupName`, `containerGroupName`, `containerName`, `location`,
 >   `api-version`, `tail` and `timestamps`.
-> - The swagger's own `ContainerGroupsGet_Succeeded.json` example, which this document models
->   its Get response on, carries `instanceView`.
+> - The swagger's own `ContainerGroupsGet_Failed.json` example is a plain Get — its
+>   `parameters` block lists only `subscriptionId`, `resourceGroupName`, `containerGroupName`
+>   and `api-version` — and its `200` body carries both the group-level `instanceView` and a
+>   per-container one. (`ContainerGroupsGet_Succeeded.json` happens to omit `instanceView`;
+>   that is an example-authoring choice, not a contract statement, since neither example can
+>   pass an `$expand` the operation does not declare.)
 > - The [test plan](container-instances-test-plan.md)'s own compatibility suites read it from a
 >   plain Get: the Java SDK's `ContainerGroup.state()` after `getByResourceGroup`, and
 >   `az container show --query instanceView.state`. Under the gating rule both return `null`.
