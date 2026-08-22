@@ -12,6 +12,8 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Deterministic coverage of {@link ContainerGroupReconciler#computeGroupState}, the pure
@@ -26,7 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * instead of {@code Running}. These cases pin every policy against every terminal shape with
  * no timing involved.</p>
  */
-@DisplayName("ContainerGroupReconciler.computeGroupState — group state machine (G2, G6, G7, G8)")
+@DisplayName("ContainerGroupReconciler — group state machine (G2, G6, G7, G8) and reconcilability")
 class ContainerGroupStateTest {
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -225,5 +227,77 @@ class ContainerGroupStateTest {
     void missingExitCodeIsNotAFailure() {
         assertEquals(GroupStateValue.SUCCEEDED,
                 state(RestartPolicy.NEVER, app("task", ContainerStateValue.TERMINATED, null)));
+    }
+
+    // ── which groups the reconciler owns at all ────────────────────────────────
+
+    /**
+     * {@link ContainerGroupReconciler#isReconcilable} decides whether a tick touches a group.
+     *
+     * <p>The {@code Failed} case is the one worth pinning: a group whose {@code PUT} failed has
+     * been rolled back — every container id nulled, every host port released — so a tick that
+     * reconciled it read the absent infra container as "the namespace owner died" and repaired
+     * it, resurrecting a deployment the client was told had failed and re-binding ports the
+     * allocator had already handed out. The end state was a group reporting {@code Running}
+     * under a {@code provisioningState} of {@code Failed}, with an orphan infra container
+     * holding a port for the life of the process.</p>
+     */
+    @Nested
+    @DisplayName("isReconcilable — which groups a tick owns")
+    class Reconcilable {
+
+        private ContainerGroup group(String provisioningState, GroupStateValue groupState,
+                                     boolean degraded) {
+            ContainerGroup group = new ContainerGroup();
+            group.setName("demo-group");
+            group.setRestartPolicy(RestartPolicy.ALWAYS);
+            group.setContainers(List.of());
+            group.setProvisioningState(provisioningState);
+            group.setGroupState(groupState);
+            group.setDegraded(degraded);
+            return group;
+        }
+
+        @Test
+        @DisplayName("a provisioned, running group is reconciled")
+        void succeededRunningIsReconciled() {
+            assertTrue(ContainerGroupReconciler.isReconcilable(
+                    group("Succeeded", GroupStateValue.RUNNING, false)));
+        }
+
+        @Test
+        @DisplayName("a group whose provisioning failed is left alone")
+        void failedProvisioningIsSkipped() {
+            assertFalse(ContainerGroupReconciler.isReconcilable(
+                    group("Failed", GroupStateValue.FAILED, false)));
+        }
+
+        @Test
+        @DisplayName("a rolled-back group that still reports Running is left alone")
+        void failedProvisioningWithRunningStateIsSkipped() {
+            assertFalse(ContainerGroupReconciler.isReconcilable(
+                    group("Failed", GroupStateValue.RUNNING, false)));
+        }
+
+        @Test
+        @DisplayName("a group with no provisioning state recorded is left alone")
+        void absentProvisioningStateIsSkipped() {
+            assertFalse(ContainerGroupReconciler.isReconcilable(
+                    group(null, GroupStateValue.RUNNING, false)));
+        }
+
+        @Test
+        @DisplayName("a deliberately stopped group is left alone")
+        void stoppedIsSkipped() {
+            assertFalse(ContainerGroupReconciler.isReconcilable(
+                    group("Succeeded", GroupStateValue.STOPPED, false)));
+        }
+
+        @Test
+        @DisplayName("a degraded group has no containers to own")
+        void degradedIsSkipped() {
+            assertFalse(ContainerGroupReconciler.isReconcilable(
+                    group("Succeeded", GroupStateValue.RUNNING, true)));
+        }
     }
 }

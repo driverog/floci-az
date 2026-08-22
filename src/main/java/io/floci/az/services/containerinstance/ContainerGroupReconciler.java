@@ -123,7 +123,7 @@ public class ContainerGroupReconciler {
     }
 
     private void reconcile(ContainerGroup group, boolean firstTick) {
-        if (group.isDegraded() || group.getGroupState() == GroupStateValue.STOPPED) {
+        if (!isReconcilable(group)) {
             return;
         }
         String key = group.storageKey();
@@ -251,6 +251,21 @@ public class ContainerGroupReconciler {
             ContainerGroupRuntime.applyTerminated(record, 1, Instant.now());
         }
         return true;
+    }
+
+    /**
+     * Whether the reconciler owns this group's containers at all.
+     *
+     * <p>A degraded group has no containers to own, a stopped group is stopped deliberately, and
+     * a group whose provisioning failed was rolled back: its containers were removed and its host
+     * ports released. Reconciling that last one would resurrect a deployment the client was told
+     * had failed — binding ports the allocator has since handed to another group, and leaving a
+     * record that reports {@code Running} under a {@code provisioningState} of {@code Failed}.</p>
+     */
+    static boolean isReconcilable(ContainerGroup group) {
+        return !group.isDegraded()
+                && group.getGroupState() != GroupStateValue.STOPPED
+                && "Succeeded".equals(group.getProvisioningState());
     }
 
     /**
