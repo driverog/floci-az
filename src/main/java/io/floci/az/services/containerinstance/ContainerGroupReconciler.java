@@ -336,12 +336,24 @@ public class ContainerGroupReconciler {
     /**
      * Whether a group declared write-only material it would need to re-create its containers.
      *
-     * <p>The stored {@code properties} are already redacted, so the evidence is the shape the
-     * redaction leaves behind: a {@code secret} volume comes back as {@code {}} but the key is
-     * still there, and an environment variable that carried a {@code secureValue} comes back
-     * with a name and neither {@code value} nor {@code secureValue}.</p>
+     * <p>The group records this when it is created, because the stored {@code properties} cannot
+     * answer it: redaction strips a {@code secureValue} down to a bare {@code name}, which is
+     * exactly what an environment variable declared with no value at all looks like — a shape
+     * Azure accepts and {@code ContainerGroupValidator} allows. Reading the fact off the
+     * redacted document therefore called a value-less variable a secret and, after a restart,
+     * marked a group permanently {@code Failed} for losing secrets it never had.</p>
+     *
+     * <p>A record written before that field existed carries {@code null}, and there the shape is
+     * still the only evidence available.</p>
      */
     static boolean needsSecrets(ContainerGroup group) {
+        if (group.getSecretsDeclared() != null) {
+            return group.getSecretsDeclared();
+        }
+        return secretsDeclaredByShape(group);
+    }
+
+    private static boolean secretsDeclaredByShape(ContainerGroup group) {
         for (Object element : asList(group.getProperties().get("volumes"))) {
             if (element instanceof Map<?, ?> volume && volume.containsKey("secret")) {
                 return true;

@@ -1023,9 +1023,17 @@ poller (`src/main/java/io/floci/az/services/vm/VmHandler.java:76-80` and
 
 1. Skip the group when it is `degraded`, or when `instanceView.state` is `Stopped`.
 2. Skip the group and append `SecretsUnavailableAfterRestart` once when the group needs its
-   secrets to re-create containers (it has a `secureValue`, a `secret` volume, or an
-   `imageRegistryCredentials` password recorded in `properties` as having been supplied) and the
-   in-memory secret map has no entry for it. Set `instanceView.state: "Failed"`.
+   secrets to re-create containers and the in-memory secret map has no entry for it. Set
+   `instanceView.state: "Failed"`.
+
+   Whether a group needs secrets is **recorded on the group at creation**
+   (`secretsDeclared`), not inferred from its stored `properties`. It cannot be inferred:
+   redaction reduces a `secureValue` to a bare `name`, which is exactly how an environment
+   variable declared with no value at all appears, and rule V21 accepts those. Reading the
+   answer off the redacted document therefore condemned a group using a value-less variable —
+   permanently, since the `Failed` state it sets is never revisited — for losing a secret it
+   never had. A record written before that field existed carries no value, and there the
+   redacted shape is still the only evidence available.
 3. `inspectState(group.infraContainerId)`. When `exists` is false or `running` is false, run the
    G14 repair. If the repair throws, apply G15.
 4. For every app container with a recorded `containerId`, `inspectState(id)` and apply the

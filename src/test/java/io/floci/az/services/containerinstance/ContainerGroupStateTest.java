@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -28,7 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * instead of {@code Running}. These cases pin every policy against every terminal shape with
  * no timing involved.</p>
  */
-@DisplayName("ContainerGroupReconciler — group state machine (G2, G6, G7, G8) and reconcilability")
+@DisplayName("ContainerGroupReconciler — the pure decisions behind a tick")
 class ContainerGroupStateTest {
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -298,6 +299,68 @@ class ContainerGroupStateTest {
         void degradedIsSkipped() {
             assertFalse(ContainerGroupReconciler.isReconcilable(
                     group("Succeeded", GroupStateValue.RUNNING, true)));
+        }
+
+    }
+
+    // ── which groups declared write-only material ──────────────────────────────
+
+    /**
+     * {@link ContainerGroupReconciler#needsSecrets} decides whether a group's containers can be
+     * recreated after a restart, and a false positive is permanent: the group is marked
+     * {@code Failed} with a {@code SecretsUnavailableAfterRestart} event and never reconciled
+     * again.
+     *
+     * <p>It used to read the answer off the stored {@code properties}, where redaction reduces a
+     * {@code secureValue} to a bare {@code name} — which is exactly how Azure represents an
+     * environment variable declared with no value at all. A group using one of those was
+     * condemned for losing a secret it never had.</p>
+     */
+    @Nested
+    @DisplayName("needsSecrets — declared, not inferred")
+    class NeedsSecrets {
+
+        private ContainerGroup group(Boolean secretsDeclared, Map<String, Object> variable) {
+            ContainerGroup group = new ContainerGroup();
+            group.setName("demo-group");
+            group.setSecretsDeclared(secretsDeclared);
+            group.setProperties(Map.of("containers", List.of(
+                    Map.of("name", "web",
+                            "properties", Map.of("environmentVariables", List.of(variable))))));
+            return group;
+        }
+
+        @Test
+        @DisplayName("a value-less environment variable is not a secret")
+        void valueLessVariableIsNotASecret() {
+            assertFalse(ContainerGroupReconciler.needsSecrets(
+                    group(false, Map.of("name", "DEBUG"))));
+        }
+
+        @Test
+        @DisplayName("a group that declared secrets needs them")
+        void declaredSecretsAreReported() {
+            assertTrue(ContainerGroupReconciler.needsSecrets(
+                    group(true, Map.of("name", "API_TOKEN"))));
+        }
+
+        @Test
+        @DisplayName("a record written before the flag existed falls back to the redacted shape")
+        void legacyRecordFallsBackToShape() {
+            assertTrue(ContainerGroupReconciler.needsSecrets(
+                    group(null, Map.of("name", "API_TOKEN"))));
+            assertFalse(ContainerGroupReconciler.needsSecrets(
+                    group(null, Map.of("name", "GREETING", "value", "hello"))));
+        }
+
+        @Test
+        @DisplayName("a secret volume in a legacy record still counts")
+        void legacySecretVolumeCounts() {
+            ContainerGroup group = new ContainerGroup();
+            group.setName("demo-group");
+            group.setProperties(Map.of("volumes",
+                    List.of(Map.of("name", "secret-volume", "secret", Map.of()))));
+            assertTrue(ContainerGroupReconciler.needsSecrets(group));
         }
     }
 }

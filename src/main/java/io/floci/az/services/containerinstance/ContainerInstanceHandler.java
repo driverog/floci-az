@@ -302,6 +302,7 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
                     existing.map(ContainerGroup::getIdentity).orElse(null)));
 
             GroupSecrets secrets = extractSecrets(body.get("properties"));
+            group.setSecretsDeclared(!secrets.isEmpty());
             Map<String, Object> properties = redactSecrets(stripReadOnly(objectToMap(body.get("properties"))));
             group.setProperties(properties);
             group.setRestartPolicy(RestartPolicy.fromWire(String.valueOf(properties.get("restartPolicy"))));

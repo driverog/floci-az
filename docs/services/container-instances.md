@@ -209,7 +209,10 @@ live only in memory, for the lifetime of the process, and are used solely to cre
   secret appears in a log line.
 - After an emulator restart the secrets are gone. Running containers are re-adopted by name, but
   a group whose containers must be re-created without its secrets is marked `Failed` with a
-  `SecretsUnavailableAfterRestart` event rather than silently started broken.
+  `SecretsUnavailableAfterRestart` event rather than silently started broken. Whether a group
+  had secrets at all is recorded when it is created: a redacted `secureValue` and an
+  environment variable declared with only a name are indistinguishable once stored, so a group
+  using the latter would otherwise be failed for losing a secret it never had.
 
 ---
 

@@ -277,6 +277,15 @@ public class ContainerInstanceModels {
         private String provisioningState = "Succeeded";
         private GroupStateValue groupState = GroupStateValue.PENDING;
         private boolean degraded;
+        /**
+         * Whether the request that created this group carried any write-only material.
+         *
+         * <p>Recorded rather than inferred: {@code properties} is stored redacted, and a
+         * redacted {@code secureValue} is indistinguishable on the wire from an environment
+         * variable declared with a name and no value, which Azure allows. {@code null} marks a
+         * record written before this field existed, where the shape is all there is to go on.</p>
+         */
+        private Boolean secretsDeclared;
         private String infraContainerId;
         private RestartPolicy restartPolicy = RestartPolicy.ALWAYS;
         private List<ContainerRecord> containers = new ArrayList<>();
@@ -326,6 +335,8 @@ public class ContainerInstanceModels {
 
         public boolean isDegraded() { return degraded; }
         public void setDegraded(boolean degraded) { this.degraded = degraded; }
+        public Boolean getSecretsDeclared() { return secretsDeclared; }
+        public void setSecretsDeclared(Boolean secretsDeclared) { this.secretsDeclared = secretsDeclared; }
 
         public String getInfraContainerId() { return infraContainerId; }
         public void setInfraContainerId(String infraContainerId) { this.infraContainerId = infraContainerId; }
