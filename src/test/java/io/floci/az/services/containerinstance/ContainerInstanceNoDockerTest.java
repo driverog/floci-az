@@ -1,6 +1,7 @@
 package io.floci.az.services.containerinstance;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -103,5 +104,77 @@ class ContainerInstanceNoDockerTest {
                 // No resource is held open by this handler.
             }
         };
+    }
+}
+
+/**
+ * Real-Docker mode pointed at a socket that does not exist. Every case runs unconditionally:
+ * this is what proves the graceful-degradation contract holds in CI, where no daemon exists.
+ */
+@QuarkusTest
+@TestProfile(ContainerInstanceDeadDaemonTest.DeadDaemonProfile.class)
+@DisplayName("Container Instances — real mode with no Docker daemon")
+class ContainerInstanceDeadDaemonTest {
+
+    static final java.nio.file.Path DEAD_DAEMON_LOG =
+            java.nio.file.Path.of("target", "aci-dead-daemon.log");
+
+    public static class DeadDaemonProfile implements QuarkusTestProfile {
+        @Override
+        public java.util.Map<String, String> getConfigOverrides() {
+            return java.util.Map.of(
+                    "floci-az.services.container-instance.mocked", "false",
+                    "floci-az.docker.docker-host", "unix:///nonexistent/docker.sock",
+                    "quarkus.log.file.enable", "true",
+                    "quarkus.log.file.append", "false",
+                    "quarkus.log.file.path", DEAD_DAEMON_LOG.toString());
+        }
+    }
+
+    @Test
+    void realModeWithNoDockerDaemonDegradesGracefully() {
+        given().post("/_admin/reset").then().statusCode(204);
+
+        given().contentType("application/json").body(FULL)
+                .when().put(groupUrl("degraded-group"))
+                .then().statusCode(201)
+                .body("properties.provisioningState", equalTo("Succeeded"))
+                .body("properties.instanceView.state", equalTo("Running"))
+                .body("properties.instanceView.events.name",
+                        org.hamcrest.Matchers.hasItem("DockerUnavailable"))
+                .body("properties.instanceView.events.find { it.name == 'DockerUnavailable' }.type",
+                        equalTo("Warning"))
+                .body("properties.instanceView.events.find { it.name == 'DockerUnavailable' }.message",
+                        equalTo("The Docker daemon is not reachable; this container group is "
+                                + "emulated without running containers."));
+
+        assertEquals("{\"content\":\"\"}",
+                given().when().get(logsUrl("degraded-group", "web"))
+                        .then().statusCode(200).extract().asString());
+
+        for (String action : List.of("start", "stop", "restart")) {
+            given().when().post(actionUrl("degraded-group", action)).then().statusCode(204);
+        }
+        given().when().delete(groupUrl("degraded-group")).then().statusCode(204);
+    }
+
+    @Test
+    void startupSucceedsWithNoDockerDaemon() throws java.io.IOException {
+        given().when().get("/health").then().statusCode(200);
+
+        assertTrue(java.nio.file.Files.exists(DEAD_DAEMON_LOG),
+                "the startup log file must exist at " + DEAD_DAEMON_LOG);
+        boolean banner = java.nio.file.Files
+                .readAllLines(DEAD_DAEMON_LOG, java.nio.charset.StandardCharsets.UTF_8).stream()
+                .anyMatch(line -> line.matches(".*\\s+aci\\s+\\[enabled \\]\\s+docker: .*"));
+        assertTrue(banner, "the banner must carry the aci line even with no Docker daemon");
+    }
+
+    @Test
+    void resetSurvivesADeadDockerDaemon() {
+        given().contentType("application/json").body(FULL)
+                .when().put(groupUrl("reset-degraded-group")).then().statusCode(201);
+        given().post("/_admin/reset").then().statusCode(204);
+        given().post("/_admin/reset").then().statusCode(204);
     }
 }

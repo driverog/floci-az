@@ -15,13 +15,20 @@ public final class ContainerInstanceProfiles {
         }
     }
 
-    /** Real Docker containers, with the reconciler ticking once per second. */
+    /**
+     * Real Docker containers, with the reconciler ticking once per second.
+     *
+     * <p>The stop grace period is shortened from the shipped 10 seconds: the test fixtures are
+     * {@code sh -c 'while true; …'} loops that ignore SIGTERM, so a group of three containers
+     * would spend 30 seconds in {@code docker stop} and exceed the HTTP client's read timeout.</p>
+     */
     public static class RealModeProfile implements QuarkusTestProfile {
         @Override
         public Map<String, String> getConfigOverrides() {
             return Map.of(
                     "floci-az.services.container-instance.mocked", "false",
-                    "floci-az.services.container-instance.reconcile-interval-seconds", "1");
+                    "floci-az.services.container-instance.reconcile-interval-seconds", "1",
+                    "floci-az.services.container-instance.stop-timeout-seconds", "2");
         }
     }
 

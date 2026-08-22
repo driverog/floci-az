@@ -13,12 +13,17 @@ import io.floci.az.core.StoredObject;
 import io.floci.az.core.arm.ArmPaths;
 import io.floci.az.core.storage.StorageBackend;
 import io.floci.az.core.storage.StorageFactory;
+import io.floci.az.services.containerinstance.ContainerGroupRuntime.ContainerGroupRuntimeException;
 import io.floci.az.services.containerinstance.ContainerInstanceModels.ContainerGroup;
 import io.floci.az.services.containerinstance.ContainerInstanceModels.ContainerRecord;
 import io.floci.az.services.containerinstance.ContainerInstanceModels.ContainerStateValue;
 import io.floci.az.services.containerinstance.ContainerInstanceModels.EventRecord;
+import io.floci.az.services.containerinstance.ContainerInstanceModels.GroupSecrets;
+import io.floci.az.services.containerinstance.ContainerInstanceModels.RegistryCredential;
 import io.floci.az.services.containerinstance.ContainerInstanceModels.GroupStateValue;
 import io.floci.az.services.containerinstance.ContainerInstanceModels.RestartPolicy;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
@@ -82,15 +87,66 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
 
     private final EmulatorConfig config;
     private final ContainerGroupValidator validator;
+    private final ContainerGroupRuntime runtime;
+    private final ContainerGroupReconciler reconciler;
     private final StorageBackend<String, StoredObject> storage;
 
     @Inject
     public ContainerInstanceHandler(EmulatorConfig config,
                                     ContainerGroupValidator validator,
+                                    ContainerGroupRuntime runtime,
+                                    ContainerGroupReconciler reconciler,
                                     StorageFactory storageFactory) {
         this.config = config;
         this.validator = validator;
+        this.runtime = runtime;
+        this.reconciler = reconciler;
         this.storage = storageFactory.create("containerinstance");
+    }
+
+    /** Never throws: a Docker failure at startup must not take the emulator down. */
+    @PostConstruct
+    public void init() {
+        try {
+            if (!mocked()) {
+                reconciler.start();
+            }
+        } catch (Exception e) {
+            LOG.errorv(e, "Failed to start container-instance reconciliation; "
+                    + "container groups will be served without runtime reconciliation");
+        }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        try {
+            reconciler.shutdown();
+        } catch (Exception e) {
+            LOG.warnv("Error stopping the container-instance reconciler: {0}", e.getMessage());
+        }
+        if (mocked()) {
+            return;
+        }
+        if (config.services().containerInstance().keepRunningOnShutdown()) {
+            LOG.infov("Leaving {0} container group(s) running (keep-running-on-shutdown=true)",
+                    scanAll().size());
+            return;
+        }
+        for (ContainerGroup group : scanAll()) {
+            if (group.isDegraded()) {
+                continue;
+            }
+            try {
+                runtime.destroyGroup(group);
+            } catch (Exception e) {
+                LOG.warnv("Error removing Docker resources for container group {0}: {1}",
+                        group.getName(), e.getMessage());
+            }
+        }
+    }
+
+    private boolean mocked() {
+        return config.services().containerInstance().mocked();
     }
 
     @Override
@@ -212,6 +268,7 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
         group.setIdentity(resolveIdentity(body.get("identity"),
                 existing.map(ContainerGroup::getIdentity).orElse(null)));
 
+        GroupSecrets secrets = extractSecrets(body.get("properties"));
         Map<String, Object> properties = redactSecrets(stripReadOnly(objectToMap(body.get("properties"))));
         group.setProperties(properties);
         group.setRestartPolicy(RestartPolicy.fromWire(String.valueOf(properties.get("restartPolicy"))));
@@ -220,7 +277,35 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
         group.setIpAddress("127.0.0.1");
         group.setFqdn(resolveFqdn(properties, group));
 
-        provisionMocked(group);
+        if (mocked()) {
+            provisionMocked(group);
+        } else {
+            java.util.concurrent.locks.ReentrantLock lock = runtime.lockFor(key);
+            lock.lock();
+            try {
+                // A PUT on an existing group replaces it: ACI has no in-place container mutation.
+                // The published host ports carry over so a client's connection details survive.
+                existing.ifPresent(previous -> {
+                    group.setPortMappings(previous.getPortMappings());
+                    if (!previous.isDegraded()) {
+                        try {
+                            runtime.destroyGroup(previous);
+                        } catch (Exception e) {
+                            LOG.warnv("Error removing the previous incarnation of container group "
+                                    + "{0}: {1}", name, e.getMessage());
+                        }
+                    }
+                });
+                provisionWithDocker(group, secrets, key);
+                write(key, group);
+            } finally {
+                lock.unlock();
+            }
+            return Response.status(isNew ? 201 : 200)
+                    .entity(toArmResponse(group, true))
+                    .type("application/json")
+                    .build();
+        }
         write(key, group);
         return Response.status(isNew ? 201 : 200)
                 .entity(toArmResponse(group, true))
@@ -241,6 +326,103 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
             container.setFinishTime(null);
             container.setRestartCount(0);
         }
+    }
+
+    /**
+     * Real-Docker provisioning. Two failure shapes, both non-fatal: an unreachable daemon
+     * degrades the group to mocked behaviour with a client-visible {@code DockerUnavailable}
+     * event, and any other failure reports {@code provisioningState: "Failed"} — exactly as
+     * Azure does, which also answers 201/200 and reports the failure through the state.
+     */
+    private void provisionWithDocker(ContainerGroup group, GroupSecrets secrets, String key) {
+        try {
+            runtime.createGroup(group, secrets);
+            runtime.rememberSecrets(key, secrets);
+        } catch (ContainerGroupRuntimeException e) {
+            if (e.isDockerUnavailable()) {
+                LOG.errorv(e, "Docker unavailable for container group {0}; "
+                        + "degrading to mocked state", group.getName());
+                degrade(group);
+                return;
+            }
+            LOG.errorv("Container group {0} could not be started: {1}", group.getName(), e.getMessage());
+            group.setProvisioningState("Failed");
+            group.setGroupState(GroupStateValue.FAILED);
+        } catch (Exception e) {
+            LOG.errorv(e, "Docker unavailable for container group {0}; degrading to mocked state",
+                    group.getName());
+            degrade(group);
+        }
+    }
+
+    /** A degraded group behaves exactly as a mocked one, and says so in its instance view. */
+    private void degrade(ContainerGroup group) {
+        group.setDegraded(true);
+        group.setInfraContainerId(null);
+        group.setIpAddress("127.0.0.1");
+        provisionMocked(group);
+        ContainerGroupRuntime.appendEvent(group.getGroupEvents(), "DockerUnavailable",
+                "The Docker daemon is not reachable; this container group is emulated without "
+                        + "running containers.", "Warning");
+    }
+
+    /**
+     * Lifts every write-only value out of the raw request body before it is redacted. This is
+     * the only path from the wire to {@link GroupSecrets}, and {@link GroupSecrets} never
+     * reaches storage, a log line, or a response.
+     */
+    static GroupSecrets extractSecrets(JsonNode properties) {
+        GroupSecrets secrets = new GroupSecrets();
+        if (properties == null || !properties.isObject()) {
+            return secrets;
+        }
+        for (String arrayName : List.of("containers", "initContainers")) {
+            JsonNode array = properties.get(arrayName);
+            if (array == null || !array.isArray()) {
+                continue;
+            }
+            boolean init = "initContainers".equals(arrayName);
+            for (JsonNode container : array) {
+                JsonNode env = container.path("properties").get("environmentVariables");
+                if (env == null || !env.isArray()) {
+                    continue;
+                }
+                Map<String, String> values = new LinkedHashMap<>();
+                for (JsonNode entry : env) {
+                    if (entry.hasNonNull("secureValue")) {
+                        values.put(entry.path("name").asText(), entry.get("secureValue").asText());
+                    }
+                }
+                if (!values.isEmpty()) {
+                    secrets.secureEnv().put(
+                            ContainerGroupRuntime.secretEnvKey(container.path("name").asText(), init),
+                            values);
+                }
+            }
+        }
+        JsonNode volumes = properties.get("volumes");
+        if (volumes != null && volumes.isArray()) {
+            for (JsonNode volume : volumes) {
+                JsonNode secret = volume.get("secret");
+                if (secret == null || !secret.isObject() || secret.isEmpty()) {
+                    continue;
+                }
+                Map<String, String> contents = new LinkedHashMap<>();
+                secret.fields().forEachRemaining(
+                        field -> contents.put(field.getKey(), field.getValue().asText()));
+                secrets.secretVolumes().put(volume.path("name").asText(), contents);
+            }
+        }
+        JsonNode credentials = properties.get("imageRegistryCredentials");
+        if (credentials != null && credentials.isArray()) {
+            for (JsonNode credential : credentials) {
+                secrets.registryCredentials().add(new RegistryCredential(
+                        credential.path("server").asText(null),
+                        credential.path("username").asText(null),
+                        credential.path("password").asText(null)));
+            }
+        }
+        return secrets;
     }
 
     private Response handleGet(String sub, String rg, String name, boolean expandInstanceView) {
@@ -265,9 +447,29 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
     }
 
     private Response handleDelete(String sub, String rg, String name) {
+        String key = storageKey(sub, rg, name);
+        if (!mocked()) {
+            java.util.concurrent.locks.ReentrantLock lock = runtime.lockFor(key);
+            lock.lock();
+            try {
+                read(key).filter(group -> !group.isDegraded()).ifPresent(group -> {
+                    try {
+                        runtime.destroyGroup(group);
+                    } catch (Exception e) {
+                        LOG.warnv("Error removing Docker resources for container group {0}: {1}",
+                                name, e.getMessage());
+                    }
+                });
+                storage.delete(key);
+            } finally {
+                lock.unlock();
+            }
+            runtime.forgetSecrets(key);
+            return Response.status(204).build();
+        }
         // 204 rather than 202: the azurerm provider's DeleteThenPoll would otherwise poll the
         // collection endpoint forever. 204 is terminal and idempotent for an absent group.
-        storage.delete(storageKey(sub, rg, name));
+        storage.delete(key);
         return Response.status(204).build();
     }
 
@@ -300,29 +502,74 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
             return ContainerInstanceErrors.groupNotFound(name, rg);
         }
         ContainerGroup group = found.get();
-        switch (action) {
-            case "stop"    -> applyMockedStop(group);
-            case "start"   -> applyMockedStart(group, false);
-            default        -> applyMockedStart(group, true);
+        boolean pureState = mocked() || group.isDegraded();
+        if (pureState) {
+            applyActionState(group, action, true);
+            write(key, group);
+            return Response.status(204).build();
         }
-        write(key, group);
+        java.util.concurrent.locks.ReentrantLock lock = runtime.lockFor(key);
+        lock.lock();
+        try {
+            try {
+                switch (action) {
+                    case "stop"  -> runtime.stopGroup(group);
+                    case "start" -> runtime.startGroup(group);
+                    default      -> runtime.restartGroup(group);
+                }
+                if (!"stop".equals(action)) {
+                    // A restarted namespace owner may come back on a different container IP, so
+                    // the address the group advertises has to be re-read rather than carried over.
+                    runtime.refreshGroupIp(group);
+                }
+            } catch (Exception e) {
+                // Non-fatal, mirroring the VM handler: the control-plane state still transitions
+                // so the client's view stays consistent, and the reconciler corrects it later.
+                LOG.warnv("Action {0} on container group {1} failed: {2}",
+                        action, name, e.getMessage());
+            }
+            applyActionState(group, action, false);
+            write(key, group);
+        } finally {
+            lock.unlock();
+        }
         // Terminal, with no Azure-AsyncOperation / Location / Retry-After header: the emulator
         // completes every operation synchronously.
         return Response.status(204).build();
     }
 
-    private void applyMockedStop(ContainerGroup group) {
-        Instant now = Instant.now();
-        group.setGroupState(GroupStateValue.STOPPED);
-        for (ContainerRecord container : group.getContainers()) {
-            container.setState(ContainerStateValue.TERMINATED);
-            container.setExitCode(0);
-            container.setFinishTime(now);
-            container.setDetailStatus("Completed");
+    private void applyActionState(ContainerGroup group, String action, boolean pureState) {
+        switch (action) {
+            case "stop"  -> applyStop(group, pureState);
+            case "start" -> applyStart(group, false, pureState);
+            default      -> applyStart(group, true, pureState);
         }
     }
 
-    private void applyMockedStart(ContainerGroup group, boolean restart) {
+    /** Transition C16 / G9. Real exit codes come from the daemon; mocked mode reports 0. */
+    private void applyStop(ContainerGroup group, boolean pureState) {
+        Instant now = Instant.now();
+        group.setGroupState(GroupStateValue.STOPPED);
+        for (ContainerRecord container : group.getContainers()) {
+            if (pureState || container.getContainerId() == null) {
+                container.setState(ContainerStateValue.TERMINATED);
+                container.setExitCode(0);
+                container.setFinishTime(now);
+                container.setDetailStatus("Completed");
+                continue;
+            }
+            var state = runtime.inspect(container.getContainerId());
+            ContainerGroupRuntime.applyTerminated(container, state.exitCode(),
+                    state.finishedAt() != null ? state.finishedAt() : now);
+        }
+        if (pureState) {
+            ContainerGroupRuntime.appendEvent(group.getGroupEvents(), "Killing",
+                    "Stopping container group " + group.getName(), "Normal");
+        }
+    }
+
+    /** Transitions C17 / G10 for {@code start}, and C18 / G13 for {@code restart}. */
+    private void applyStart(ContainerGroup group, boolean restart, boolean pureState) {
         Instant now = Instant.now();
         group.setGroupState(GroupStateValue.RUNNING);
         for (ContainerRecord container : group.getContainers()) {
@@ -331,7 +578,14 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
                 container.setRestartCount(container.getRestartCount() + 1);
             }
             container.setState(ContainerStateValue.RUNNING);
-            container.setStartTime(now);
+            Instant startedAt = now;
+            if (!pureState && container.getContainerId() != null) {
+                var state = runtime.inspect(container.getContainerId());
+                if (state.startedAt() != null) {
+                    startedAt = state.startedAt();
+                }
+            }
+            container.setStartTime(startedAt);
             container.setExitCode(null);
             container.setFinishTime(null);
             container.setDetailStatus("");
@@ -370,12 +624,12 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
                 .type("application/json").build();
     }
 
-    /**
-     * Mocked mode has no container to read from, so the log content is always empty. Commit 6
-     * overrides this for real-Docker mode.
-     */
-    protected String readLogs(ContainerGroup group, String containerName, Integer tail, boolean timestamps) {
-        return "";
+    /** Mocked and degraded groups have no container to read from, so their logs are empty. */
+    private String readLogs(ContainerGroup group, String containerName, Integer tail, boolean timestamps) {
+        if (mocked() || group.isDegraded()) {
+            return "";
+        }
+        return runtime.readLogs(group, containerName, tail, timestamps);
     }
 
     // ── Read-only collections ──────────────────────────────────────────────────────────────
@@ -798,9 +1052,31 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
         return groups;
     }
 
-    /** Wipes every container group — used by {@code POST /_admin/reset}. */
+    /**
+     * Wipes every container group — used by {@code POST /_admin/reset}. Self-contained and
+     * idempotent: {@code AdminController} invokes every {@code Resettable} in arbitrary order and
+     * swallows individual failures, so a dead Docker daemon must not make this the one that fails.
+     */
     @Override
     public void clear() {
+        if (!mocked()) {
+            for (ContainerGroup group : scanAll()) {
+                if (group.isDegraded()) {
+                    continue;
+                }
+                java.util.concurrent.locks.ReentrantLock lock = runtime.lockFor(group.storageKey());
+                lock.lock();
+                try {
+                    runtime.destroyGroup(group);
+                } catch (Exception e) {
+                    LOG.warnv("Reset: failed to remove Docker resources for container group "
+                            + "{0}: {1}", group.getName(), e.getMessage());
+                } finally {
+                    lock.unlock();
+                }
+            }
+            runtime.forgetAllSecrets();
+        }
         storage.clear();
     }
 
