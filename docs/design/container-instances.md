@@ -247,6 +247,17 @@ Two core methods do **not** exist today and are specified as new work:
   (`ImageCacheService.java:132`). Per-request `imageRegistryCredentials` cannot flow through it.
   The overload is specified in the [runtime design](container-instances-runtime.md#image-pull-and-registry-credentials).
 
+  Adding the overload also makes the pull cache credential-aware, because the two are not
+  separable: the cache was keyed on the image alone, so the first caller's pull answered every
+  later one and a group supplying different — or invalid — credentials for an image another
+  group had already fetched was never authenticated at all. The key now includes a digest of
+  the supplied credential (the password itself is not retained in a long-lived map key), and a
+  caller that supplies credentials does not take the "already present locally" shortcut, since
+  answering from a local image is exactly how an unauthenticated group would come up
+  `Succeeded` where Azure reports an inaccessible image. Callers that supply no credentials of
+  their own — every non-ACI caller, and any ACI group without `imageRegistryCredentials` —
+  keep the previous behaviour unchanged, and with it the ability to run offline.
+
 `PortAllocator.release(int)` and `PortAllocator.markReserved(int)` exist but have **no
 production callers** on `upstream/main` (verified by grepping `src/main/java` for
 `release(` and `markReserved(`; the only hits are `WarmPool.release(ContainerHandle)` and

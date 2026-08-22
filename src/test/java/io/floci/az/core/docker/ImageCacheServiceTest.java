@@ -5,11 +5,14 @@ import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.InternalServerErrorException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.exception.UnauthorizedException;
+import com.github.dockerjava.api.model.AuthConfig;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -114,5 +117,48 @@ class ImageCacheServiceTest {
                     throw new InterruptedException("interrupted mid-pull");
                 }));
         assertEquals(1, calls.get());
+    }
+
+    // ── Cache identity ─────────────────────────────────────────────────────────
+
+    /**
+     * The pull cache was keyed on the image alone, so the first caller's pull answered every
+     * later one: a container group supplying different — or invalid — registry credentials for an
+     * image another group had already fetched was never authenticated against the registry.
+     */
+    private static AuthConfig auth(String server, String username, String password) {
+        return new AuthConfig()
+                .withRegistryAddress(server)
+                .withUsername(username)
+                .withPassword(password);
+    }
+
+    @Test
+    void cacheKeyIsTheImageWhenNoCredentialsAreSupplied() {
+        assertEquals(IMAGE, ImageCacheService.cacheKey(IMAGE, null));
+    }
+
+    @Test
+    void cacheKeyIsStableForTheSameCredentials() {
+        assertEquals(ImageCacheService.cacheKey(IMAGE, auth("reg.example.com", "alice", "one")),
+                ImageCacheService.cacheKey(IMAGE, auth("reg.example.com", "alice", "one")));
+    }
+
+    @Test
+    void cacheKeySeparatesCallersWithDifferentCredentials() {
+        String alice = ImageCacheService.cacheKey(IMAGE, auth("reg.example.com", "alice", "one"));
+        assertNotEquals(alice, ImageCacheService.cacheKey(IMAGE, auth("reg.example.com", "alice", "two")),
+                "a different password must not be answered from another caller's pull");
+        assertNotEquals(alice, ImageCacheService.cacheKey(IMAGE, auth("reg.example.com", "bob", "one")),
+                "a different user must not be answered from another caller's pull");
+        assertNotEquals(alice, ImageCacheService.cacheKey(IMAGE, null),
+                "an anonymous pull must not be answered from an authenticated one");
+    }
+
+    @Test
+    void cacheKeyDoesNotRetainTheCredentialInClearText() {
+        assertFalse(ImageCacheService.cacheKey(IMAGE, auth("reg.example.com", "alice", "s3cr3t-token"))
+                        .contains("s3cr3t-token"),
+                "the key is long-lived, so the password must only take part as a digest");
     }
 }

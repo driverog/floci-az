@@ -213,6 +213,9 @@ live only in memory, for the lifetime of the process, and are used solely to cre
   had secrets at all is recorded when it is created: a redacted `secureValue` and an
   environment variable declared with only a name are indistinguishable once stored, so a group
   using the latter would otherwise be failed for losing a secret it never had.
+- Registry credentials are checked per deployment. Two groups pulling the same private image
+  with different credentials each authenticate; one group's successful pull does not vouch for
+  another's.
 
 ---
 

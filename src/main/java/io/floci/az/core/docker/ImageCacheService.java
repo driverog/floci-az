@@ -10,18 +10,26 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Ensures each Docker image is pulled only once per process lifetime.
+ * Ensures each Docker image is pulled only once per process lifetime, per set of credentials it
+ * is pulled with.
  */
 @ApplicationScoped
 public class ImageCacheService {
 
     private static final Logger LOG = Logger.getLogger(ImageCacheService.class);
+
+    /** Separator for the cache key's parts; cannot occur in a host, user or password. */
+    private static final String FIELD_SEPARATOR = "\u0000";
 
     static final int MAX_PULL_ATTEMPTS = 3;
     static final long INITIAL_BACKOFF_MS = 500L;
@@ -52,16 +60,23 @@ public class ImageCacheService {
      *                 the configured {@code floci-az.docker.registry-credentials}
      */
     public void ensureImageExists(String imageUri, AuthConfig auth) {
-        if (pulledImages.contains(imageUri)) {
+        String cacheKey = cacheKey(imageUri, auth);
+        if (pulledImages.contains(cacheKey)) {
             return;
         }
-        Object lock = locks.computeIfAbsent(imageUri, k -> new Object());
+        Object lock = locks.computeIfAbsent(cacheKey, k -> new Object());
         synchronized (lock) {
-            if (pulledImages.contains(imageUri)) {
+            if (pulledImages.contains(cacheKey)) {
                 return;
             }
-            if (isLocalImagePresent(imageUri)) {
-                pulledImages.add(imageUri);
+            // A caller that supplied its own credentials gets them checked. Answering such a pull
+            // from an image another caller already brought down would let a container group
+            // deploy against a registry it cannot authenticate to, reporting Succeeded where
+            // Azure reports an inaccessible image — the divergence an emulator exists to catch.
+            // Callers with no credentials of their own keep the local-image fast path, and with
+            // it the ability to run offline.
+            if (auth == null && isLocalImagePresent(imageUri)) {
+                pulledImages.add(cacheKey);
                 LOG.infov("Image already present locally: {0}", imageUri);
                 return;
             }
@@ -72,12 +87,35 @@ public class ImageCacheService {
                                 .withAuthConfig(resolveAuth(imageUri, auth))
                                 .exec(new PullImageResultCallback())
                                 .awaitCompletion(5, TimeUnit.MINUTES));
-                pulledImages.add(imageUri);
+                pulledImages.add(cacheKey);
                 LOG.infov("Image pulled successfully: {0}", imageUri);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException("Interrupted while pulling image: " + imageUri, e);
             }
+        }
+    }
+
+    /**
+     * Cache identity for one pull, credentials included.
+     *
+     * <p>Keying on the image alone let the first caller's pull satisfy every later one, so a
+     * group supplying different — or invalid — registry credentials for an image some other
+     * group had already fetched was never authenticated at all. The credential itself is not
+     * retained: only a digest of it takes part, so no password sits in a long-lived map key.</p>
+     */
+    static String cacheKey(String imageUri, AuthConfig auth) {
+        if (auth == null) {
+            return imageUri;
+        }
+        String material = auth.getRegistryAddress() + FIELD_SEPARATOR + auth.getUsername()
+                + FIELD_SEPARATOR + auth.getPassword();
+        try {
+            byte[] hash = MessageDigest.getInstance("SHA-256")
+                    .digest(material.getBytes(StandardCharsets.UTF_8));
+            return imageUri + FIELD_SEPARATOR + HexFormat.of().formatHex(hash);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
         }
     }
 
