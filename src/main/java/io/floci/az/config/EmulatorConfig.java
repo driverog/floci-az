@@ -86,6 +86,7 @@ public interface EmulatorConfig {
         ServiceStorageConfig serviceBus();
         ServiceStorageConfig sql();
         ServiceStorageConfig monitor();
+        ServiceStorageConfig containerInstance();
     }
 
     interface ServiceStorageConfig {
@@ -127,6 +128,7 @@ public interface EmulatorConfig {
         ServiceBusConfig       serviceBus();
         AksConfig              aks();
         VmConfig               vm();
+        ContainerInstanceConfig containerInstance();
         ApimConfig             apim();
         RedisConfig            redis();
         AcrConfig              acr();
@@ -287,6 +289,68 @@ public interface EmulatorConfig {
         /** Default Docker image used when an imageReference cannot be resolved (non-mocked mode). */
         @WithDefault("ubuntu:22.04")
         String defaultImage();
+    }
+
+    /**
+     * Microsoft.ContainerInstance — container groups backed by a Docker pod: one
+     * infrastructure container owning the network namespace plus one container per ACI
+     * container joined to it with network mode {@code container:<id>}.
+     */
+    interface ContainerInstanceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * When {@code true}, no Docker container is created; container groups transition
+         * immediately to {@code Succeeded} with every container {@code Running} and logs empty.
+         * Useful for tests without Docker.
+         */
+        @WithDefault("true")
+        boolean mocked();
+
+        /** Image for the namespace-owning infrastructure container. */
+        @WithDefault("alpine:3.20")
+        String infraImage();
+
+        /** Location used when a request omits it, and the region label in the FQDN. */
+        @WithDefault("eastus")
+        String defaultLocation();
+
+        /** Low end of the host-port fallback range. */
+        @WithDefault("8500")
+        int basePort();
+
+        /** High end of the host-port fallback range. */
+        @WithDefault("8599")
+        int maxPort();
+
+        /** Reconciler period in seconds. */
+        @WithDefault("3")
+        int reconcileIntervalSeconds();
+
+        /** {@code docker stop} grace period in seconds. */
+        @WithDefault("10")
+        int stopTimeoutSeconds();
+
+        /** Byte cap for a running container's logs (Azure: 4 MB). */
+        @WithDefault("4194304")
+        long logMaxBytes();
+
+        /** Line cap for a running container's logs. */
+        @WithDefault("100000")
+        int logMaxLines();
+
+        /** Byte cap for a stopped container's logs (Azure: 16 KB). */
+        @WithDefault("16384")
+        long stoppedLogMaxBytes();
+
+        /** Line cap for a stopped container's logs (Azure: 1 000 lines). */
+        @WithDefault("1000")
+        int stoppedLogMaxLines();
+
+        /** When {@code true}, container groups are left running when floci-az shuts down. */
+        @WithDefault("false")
+        boolean keepRunningOnShutdown();
     }
 
     interface RedisConfig {

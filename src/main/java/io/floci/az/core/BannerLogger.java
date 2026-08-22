@@ -100,6 +100,14 @@ public class BannerLogger {
                     : "image:" + config.services().vm().defaultImage();
             sb.append(serviceStatusDocker("vm", true, vmInfo));
         }
+        if (config.services().containerInstance().enabled()) {
+            String aciInfo = config.services().containerInstance().mocked()
+                    ? "mocked  (no docker)"
+                    : "infra:" + config.services().containerInstance().infraImage()
+                            + "  ports:" + config.services().containerInstance().basePort()
+                            + "-" + config.services().containerInstance().maxPort();
+            sb.append(serviceStatusDocker("aci", true, aciInfo));
+        }
         if (config.services().redis().enabled()) {
             String redisInfo = config.services().redis().mocked()
                     ? "mocked  (no docker)"

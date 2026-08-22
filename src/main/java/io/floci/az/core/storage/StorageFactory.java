@@ -144,6 +144,7 @@ public class StorageFactory {
             case "servicebus" -> Optional.of(config.storage().services().serviceBus());
             case "sql"        -> Optional.of(config.storage().services().sql());
             case "monitor"    -> Optional.of(config.storage().services().monitor());
+            case "containerinstance" -> Optional.of(config.storage().services().containerInstance());
             default           -> Optional.empty();
         };
     }
