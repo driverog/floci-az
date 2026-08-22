@@ -20,12 +20,14 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * The 3-second poller that owns restart decisions. Docker's own restart policies cannot be
@@ -53,7 +55,8 @@ public class ContainerGroupReconciler {
         thread.setDaemon(true);
         return thread;
     });
-    private final AtomicBoolean adopted = new AtomicBoolean(false);
+    /** Storage keys already re-attached to their surviving containers, one entry per group. */
+    private final Set<String> adoptedKeys = ConcurrentHashMap.newKeySet();
 
     @Inject
     public ContainerGroupReconciler(EmulatorConfig config,
@@ -92,8 +95,12 @@ public class ContainerGroupReconciler {
                         + "reconciliation tick: {0}", unreachable.get());
                 return;
             }
-            boolean firstTick = adopted.compareAndSet(false, true);
-            for (ContainerGroup group : scanAll()) {
+            List<ContainerGroup> groups = scanAll();
+            Set<String> live = new HashSet<>();
+            groups.forEach(group -> live.add(group.storageKey()));
+            // Deleted groups must not keep an entry for the life of the process.
+            adoptedKeys.retainAll(live);
+            for (ContainerGroup group : groups) {
                 java.util.concurrent.locks.ReentrantLock lock = runtime.lockFor(group.storageKey());
                 if (!lock.tryLock()) {
                     // A request is mutating this group right now; reconciling a half-applied
@@ -109,7 +116,7 @@ public class ContainerGroupReconciler {
                     if (current == null) {
                         continue;
                     }
-                    reconcile(current, firstTick);
+                    reconcile(current);
                 } catch (Exception e) {
                     LOG.warnv("Error reconciling container group {0}: {1}",
                             group.getName(), e.getMessage());
@@ -122,13 +129,16 @@ public class ContainerGroupReconciler {
         }
     }
 
-    private void reconcile(ContainerGroup group, boolean firstTick) {
-        if (!isReconcilable(group)) {
-            return;
-        }
+    private void reconcile(ContainerGroup group) {
         String key = group.storageKey();
-        if (firstTick) {
-            runtime.adopt(group);
+        boolean adopted = adoptIfNeeded(group, key);
+        if (!isReconcilable(group)) {
+            if (adopted) {
+                // A stopped group is not reconciled, but adoption may still have re-attached it
+                // to the containers it left behind, and those ids have to survive the tick.
+                write(key, group);
+            }
+            return;
         }
         if (needsSecrets(group) && !runtime.hasSecrets(key)) {
             if (group.getGroupState() != GroupStateValue.FAILED) {
@@ -144,7 +154,7 @@ public class ContainerGroupReconciler {
             return;
         }
 
-        boolean changed = firstTick;
+        boolean changed = adopted;
         GroupSecrets secrets = runtime.secrets(key);
 
         ContainerRuntimeState infra = runtime.inspect(group.getInfraContainerId());
@@ -269,18 +279,47 @@ public class ContainerGroupReconciler {
     }
 
     /**
-     * Whether the reconciler owns this group's containers at all.
+     * Re-attaches one group to the containers and host ports that outlived the emulator process.
      *
-     * <p>A degraded group has no containers to own, a stopped group is stopped deliberately, and
-     * a group whose provisioning failed was rolled back: its containers were removed and its host
-     * ports released. Reconciling that last one would resurrect a deployment the client was told
-     * had failed — binding ports the allocator has since handed to another group, and leaving a
-     * record that reports {@code Running} under a {@code provisioningState} of {@code Failed}.</p>
+     * <p>Once per group, not once per process. A single process-wide flag was consumed by the
+     * first tick whether or not every group was actually adopted on it, so a group whose lock a
+     * request happened to hold was skipped permanently — and stopped groups were skipped
+     * deterministically, since they return before this point. Adoption is the only thing that
+     * re-reserves a surviving group's host ports, so the allocator went on to hand a live port
+     * to the next group that asked for one, whose infra container then failed to bind it.</p>
+     *
+     * @return whether the group was adopted on this call, and so may have changed
+     */
+    private boolean adoptIfNeeded(ContainerGroup group, String key) {
+        // A degraded or rolled-back group holds nothing: its containers were never created or
+        // were removed, and rollback released its ports. Re-reserving them would take a port
+        // from whichever group the allocator has since given it to.
+        if (!isProvisioned(group) || !adoptedKeys.add(key)) {
+            return false;
+        }
+        runtime.adopt(group);
+        return true;
+    }
+
+    /**
+     * Whether this group's containers and ports are real — it provisioned successfully and is not
+     * emulating its way through an absent Docker daemon.
+     */
+    static boolean isProvisioned(ContainerGroup group) {
+        return !group.isDegraded() && "Succeeded".equals(group.getProvisioningState());
+    }
+
+    /**
+     * Whether the reconciler owns this group's container states.
+     *
+     * <p>Beyond {@link #isProvisioned}, a stopped group is stopped deliberately and must stay
+     * that way. A group whose provisioning failed was rolled back: reconciling it would
+     * resurrect a deployment the client was told had failed — binding ports the allocator has
+     * since handed to another group, and leaving a record that reports {@code Running} under a
+     * {@code provisioningState} of {@code Failed}.</p>
      */
     static boolean isReconcilable(ContainerGroup group) {
-        return !group.isDegraded()
-                && group.getGroupState() != GroupStateValue.STOPPED
-                && "Succeeded".equals(group.getProvisioningState());
+        return isProvisioned(group) && group.getGroupState() != GroupStateValue.STOPPED;
     }
 
     /**

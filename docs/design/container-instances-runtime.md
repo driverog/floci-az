@@ -1021,7 +1021,12 @@ poller (`src/main/java/io/floci/az/services/vm/VmHandler.java:76-80` and
 
 **What one tick does**, for every group returned by `storage.scan(k -> true)`:
 
-1. Skip the group when it is `degraded`, or when `instanceView.state` is `Stopped`.
+1. Skip the group when it is `degraded`, when `instanceView.state` is `Stopped`, or when
+   `provisioningState` is anything but `Succeeded`. That last condition matters: a group whose
+   `PUT` failed has been rolled back — every container id nulled, every host port released — so
+   reconciling it would read the absent infra container as a dead namespace owner and repair it,
+   resurrecting a deployment the client was told had failed and re-binding ports the allocator
+   has since handed out. Adoption is gated more loosely; see below.
 2. Skip the group and append `SecretsUnavailableAfterRestart` once when the group needs its
    secrets to re-create containers and the in-memory secret map has no entry for it. Set
    `instanceView.state: "Failed"`.
@@ -1044,7 +1049,17 @@ poller (`src/main/java/io/floci/az/services/vm/VmHandler.java:76-80` and
    change flag as it goes; an unchanged group is not rewritten, so a `wal` or `persistent`
    backend is not churned every 3 seconds.
 
-**Adoption after an emulator restart.** The first tick after startup, for every stored group:
+**Adoption after an emulator restart.** Once per group — tracked by storage key, not by a single
+process-wide "first tick" flag. The distinction is load-bearing: a flag consumed by the first
+tick is spent whether or not each group was actually adopted on it, so a group whose lock a
+request happened to be holding was skipped forever, and stopped groups were skipped
+deterministically because step 1 returns before adoption is reached. Since adoption is the only
+thing that re-reserves a surviving group's host ports, the allocator then handed a live port to
+the next group that asked, whose infra container failed to bind it.
+
+Adoption runs for any group that provisioned successfully and is not degraded — including
+stopped ones, which still own real containers and real port reservations — but not for a
+rolled-back group, whose ports were released and must not be re-reserved. For each such group:
 
 - `portAllocator.markReserved(hostPort)` for every recorded mapping.
 - When `inspectState(infraContainerId)` reports `exists == false`, look the infra container up

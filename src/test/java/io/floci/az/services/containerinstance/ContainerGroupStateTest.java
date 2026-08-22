@@ -301,6 +301,27 @@ class ContainerGroupStateTest {
                     group("Succeeded", GroupStateValue.RUNNING, true)));
         }
 
+        /**
+         * Adoption is gated more loosely than reconciliation: a stopped group keeps real
+         * containers and real host-port reservations, so it must still be re-attached after a
+         * restart even though its states are left alone.
+         */
+        @Test
+        @DisplayName("a stopped group is still adopted, though it is not reconciled")
+        void stoppedIsProvisionedButNotReconcilable() {
+            ContainerGroup stopped = group("Succeeded", GroupStateValue.STOPPED, false);
+            assertTrue(ContainerGroupReconciler.isProvisioned(stopped));
+            assertFalse(ContainerGroupReconciler.isReconcilable(stopped));
+        }
+
+        @Test
+        @DisplayName("a rolled-back group holds nothing to adopt")
+        void failedIsNotProvisioned() {
+            assertFalse(ContainerGroupReconciler.isProvisioned(
+                    group("Failed", GroupStateValue.FAILED, false)));
+            assertFalse(ContainerGroupReconciler.isProvisioned(
+                    group("Succeeded", GroupStateValue.RUNNING, true)));
+        }
     }
 
     // ── which groups declared write-only material ──────────────────────────────
