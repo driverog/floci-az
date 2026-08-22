@@ -6,6 +6,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.LogContainerCmd;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Bind;
@@ -29,6 +30,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -36,6 +39,8 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Manages Docker container lifecycle operations including create, start, stop, remove,
@@ -497,6 +502,163 @@ public class ContainerLifecycleManager {
     public EndpointInfo resolveEndpoint(String containerId, int containerPort) {
         InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
         return resolveEndpoint(inspect, containerPort, null);
+    }
+
+    /**
+     * Result of a bounded log read.
+     *
+     * @param content   the log text, UTF-8 decoded, newline-terminated per line
+     * @param truncated true when the read stopped because a cap was reached rather than because
+     *                  the container's log ended
+     */
+    public record LogResult(String content, boolean truncated) {}
+
+    /**
+     * Reads a container's logs without following, stopping as soon as either cap is reached.
+     *
+     * <p>Both streams are read and interleaved in the order the daemon recorded them, matching
+     * {@code docker logs}. The read never buffers more than {@code maxBytes} of log text: the
+     * result callback is closed from within its own {@code onNext}, which terminates the
+     * underlying HTTP stream, so a container producing gigabytes of output costs a bounded
+     * amount of heap.</p>
+     *
+     * <p>A stopped container's logs are still available; a removed container has none. Docker
+     * retains logs subject to the container's log-driver rotation settings — floci-az containers
+     * use the {@code json-file} driver with {@code max-size} and {@code max-file} from
+     * {@code floci-az.docker.log-max-size} / {@code log-max-file}.</p>
+     *
+     * @param containerId the container id or name
+     * @param tail        number of lines to read from the end of the merged stream, or
+     *                    {@code null} for all available lines
+     * @param timestamps  when true, each line is prefixed with an RFC 3339 nanosecond UTC
+     *                    timestamp and a single space, exactly as {@code docker logs --timestamps}
+     *                    emits it
+     * @param maxBytes    hard cap on the number of UTF-8 characters accumulated; the read stops
+     *                    at the first frame that would exceed it, and that frame is discarded
+     * @param maxLines    hard cap on the number of newline characters accumulated; the read stops
+     *                    at the first frame that would exceed it, and that frame is discarded
+     * @param timeout     maximum time to wait for the stream to complete
+     * @return the bounded log content and whether a cap cut it short
+     * @throws com.github.dockerjava.api.exception.NotFoundException when no such container exists
+     */
+    public LogResult fetchLogs(String containerId, Integer tail, boolean timestamps,
+                               long maxBytes, int maxLines, Duration timeout) {
+        StringBuilder sink = new StringBuilder();
+        AtomicInteger lines = new AtomicInteger();
+        AtomicBoolean truncated = new AtomicBoolean(false);
+
+        LogContainerCmd cmd = dockerClient.logContainerCmd(containerId)
+                .withStdOut(true)
+                .withStdErr(true)
+                .withFollowStream(false)
+                .withTimestamps(timestamps);
+        if (tail == null) {
+            cmd.withTailAll();
+        } else {
+            cmd.withTail(tail);
+        }
+
+        ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<>() {
+            @Override
+            public void onNext(Frame frame) {
+                if (truncated.get()) {
+                    return;
+                }
+                String text = new String(frame.getPayload(), StandardCharsets.UTF_8);
+                long newlines = text.chars().filter(c -> c == '\n').count();
+                if (sink.length() + text.length() > maxBytes || lines.get() + newlines > maxLines) {
+                    truncated.set(true);
+                    // Closing from inside onNext is what terminates the underlying HTTP stream;
+                    // accumulating everything and truncating afterwards would defeat the cap.
+                    try {
+                        close();
+                    } catch (IOException e) {
+                        LOG.debugv("Closing log stream for {0} after cap: {1}",
+                                containerId, e.getMessage());
+                    }
+                    return;
+                }
+                sink.append(text);
+                lines.addAndGet((int) newlines);
+            }
+        };
+
+        try {
+            cmd.exec(callback);
+            callback.awaitCompletion(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted reading logs for container " + containerId, ie);
+        } finally {
+            try {
+                callback.close();
+            } catch (IOException e) {
+                LOG.debugv("Error closing log callback for {0}: {1}", containerId, e.getMessage());
+            }
+        }
+        return new LogResult(sink.toString(), truncated.get());
+    }
+
+    /**
+     * A container's runtime state, as reported by {@code docker inspect}.
+     *
+     * @param exists     false when the container is unknown to the daemon
+     * @param running    true when {@code State.Running} is true
+     * @param exitCode   {@code State.ExitCode}; meaningful only when {@code running} is false
+     * @param startedAt  {@code State.StartedAt}, or null when the container has never started
+     * @param finishedAt {@code State.FinishedAt}, or null when the container has not exited
+     * @param oomKilled  {@code State.OOMKilled}
+     */
+    public record ContainerRuntimeState(boolean exists, boolean running, int exitCode,
+                                        Instant startedAt, Instant finishedAt, boolean oomKilled) {
+
+        public static final ContainerRuntimeState ABSENT =
+                new ContainerRuntimeState(false, false, 0, null, null, false);
+    }
+
+    /** Docker's sentinel for a timestamp that has never been set. */
+    private static final String NEVER_TIMESTAMP = "0001-01-01T00:00:00Z";
+
+    /**
+     * Inspects a container and returns its runtime state. A missing container yields
+     * {@link ContainerRuntimeState#ABSENT}. Any other Docker error is logged at WARN and also
+     * yields {@code ABSENT}, mirroring {@link #isContainerRunning}: a false "absent" costs a
+     * clean re-create, while a false "running" would strand a dead container.
+     */
+    public ContainerRuntimeState inspectState(String containerId) {
+        try {
+            InspectContainerResponse.ContainerState state =
+                    dockerClient.inspectContainerCmd(containerId).exec().getState();
+            if (state == null) {
+                return ContainerRuntimeState.ABSENT;
+            }
+            return new ContainerRuntimeState(
+                    true,
+                    Boolean.TRUE.equals(state.getRunning()),
+                    state.getExitCodeLong() == null ? 0 : state.getExitCodeLong().intValue(),
+                    parseDockerTimestamp(state.getStartedAt()),
+                    parseDockerTimestamp(state.getFinishedAt()),
+                    Boolean.TRUE.equals(state.getOOMKilled()));
+        } catch (NotFoundException e) {
+            return ContainerRuntimeState.ABSENT;
+        } catch (Exception e) {
+            LOG.warnv("State inspection failed for container {0}; treating as absent: {1}",
+                    containerId, e.getMessage());
+            return ContainerRuntimeState.ABSENT;
+        }
+    }
+
+    /** Docker reports "never" as {@code 0001-01-01T00:00:00Z}; that and any junk map to null. */
+    private static Instant parseDockerTimestamp(String value) {
+        if (value == null || value.isBlank() || NEVER_TIMESTAMP.equals(value)) {
+            return null;
+        }
+        try {
+            return Instant.parse(value);
+        } catch (Exception e) {
+            LOG.debugv("Unparseable Docker timestamp ''{0}'': {1}", value, e.getMessage());
+            return null;
+        }
     }
 
     /**

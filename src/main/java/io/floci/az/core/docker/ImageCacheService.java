@@ -38,6 +38,20 @@ public class ImageCacheService {
     }
 
     public void ensureImageExists(String imageUri) {
+        ensureImageExists(imageUri, null);
+    }
+
+    /**
+     * Ensures {@code imageUri} is present locally, pulling it with the supplied credentials when
+     * it is not. Behaves exactly like {@link #ensureImageExists(String)} — pull-once per process,
+     * transient-failure retry, five-minute pull timeout — except that {@code auth}, when non-null,
+     * replaces the credentials {@link #resolveAuth} would have derived from configuration.
+     *
+     * @param imageUri the image reference, for example {@code myregistry.example.com/app:1.0}
+     * @param auth     registry credentials to use for this pull, or {@code null} to fall back to
+     *                 the configured {@code floci-az.docker.registry-credentials}
+     */
+    public void ensureImageExists(String imageUri, AuthConfig auth) {
         if (pulledImages.contains(imageUri)) {
             return;
         }
@@ -55,7 +69,7 @@ public class ImageCacheService {
             try {
                 runWithRetry(imageUri, MAX_PULL_ATTEMPTS, INITIAL_BACKOFF_MS,
                         () -> dockerClient.pullImageCmd(imageUri)
-                                .withAuthConfig(resolveAuth(imageUri))
+                                .withAuthConfig(resolveAuth(imageUri, auth))
                                 .exec(new PullImageResultCallback())
                                 .awaitCompletion(5, TimeUnit.MINUTES));
                 pulledImages.add(imageUri);
@@ -65,6 +79,20 @@ public class ImageCacheService {
                 throw new RuntimeException("Interrupted while pulling image: " + imageUri, e);
             }
         }
+    }
+
+    /**
+     * Credential-shaped overload of {@link #ensureImageExists(String, AuthConfig)}, so callers
+     * outside {@code core/docker} can supply per-request registry credentials without depending
+     * on the docker-java API. A null or blank {@code server} falls back to the configured
+     * {@code floci-az.docker.registry-credentials}.
+     */
+    public void ensureImageExists(String imageUri, String server, String username, String password) {
+        AuthConfig auth = server == null || server.isBlank() ? null : new AuthConfig()
+                .withUsername(username)
+                .withPassword(password)
+                .withRegistryAddress(server);
+        ensureImageExists(imageUri, auth);
     }
 
     /**
@@ -129,7 +157,13 @@ public class ImageCacheService {
         }
     }
 
-    private AuthConfig resolveAuth(String imageUri) {
+    /** A caller-supplied {@code AuthConfig} wins over the configured registry credentials. */
+    private AuthConfig resolveAuth(String imageUri, AuthConfig supplied) {
+        if (supplied != null) {
+            LOG.debugv("Using request-supplied credentials for registry: {0}",
+                    extractRegistryHost(imageUri));
+            return supplied;
+        }
         String host = extractRegistryHost(imageUri);
         for (EmulatorConfig.DockerConfig.RegistryCredential cred : registryCredentials) {
             if (cred.server().equals(host)) {
@@ -143,7 +177,11 @@ public class ImageCacheService {
         return new AuthConfig();
     }
 
-    static String extractRegistryHost(String imageUri) {
+    /**
+     * The registry host of an image reference: the first {@code /}-separated segment when it
+     * contains a {@code .} or a {@code :}, otherwise the empty string (meaning Docker Hub).
+     */
+    public static String extractRegistryHost(String imageUri) {
         String firstSegment = imageUri.split("/")[0];
         return (firstSegment.contains(".") || firstSegment.contains(":")) ? firstSegment : "";
     }
