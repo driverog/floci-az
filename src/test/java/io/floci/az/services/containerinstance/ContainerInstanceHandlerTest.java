@@ -109,13 +109,19 @@ class ContainerInstanceHandlerTest {
                 .body("error.target", nullValue());
     }
 
+    /**
+     * {@code ContainerGroups_Get} has no {@code $expand} parameter in the 2023-05-01 contract, so
+     * {@code instanceView} is part of every Get response — which is what the Java management SDK's
+     * {@code ContainerGroup.state()} and {@code az container show} both read.
+     */
     @Test
-    void getOmitsInstanceViewWithoutExpand() {
+    void getIncludesInstanceViewWithoutExpand() {
         create("demo-group", FULL);
         given().when().get(groupUrl("demo-group"))
                 .then().statusCode(200)
-                .body("properties.instanceView", nullValue())
-                .body("properties.containers[0].properties.instanceView", nullValue());
+                .body("properties.instanceView.state", equalTo("Running"))
+                .body("properties.containers[0].properties.instanceView.currentState.state",
+                        equalTo("Running"));
     }
 
     @Test

@@ -294,7 +294,7 @@ marker, with the query string stripped for matching. `{sub}` and `{rg}` are extr
 | `GET` | `containerGroups` | subscription (path has no `/resourceGroups/`) | `handleListBySubscription` | `200` `{"value":[...]}` |
 | `GET` | `containerGroups` | resource group | `handleListByResourceGroup` | `200` `{"value":[...]}` |
 | `PUT` | `containerGroups/{name}` | resource group | `handleCreateOrUpdate` | `201` on create, `200` on update, full container group body |
-| `GET` | `containerGroups/{name}` | resource group | `handleGet` | `200` full container group body; `instanceView` included when `$expand` contains `instanceview` (case-insensitive) |
+| `GET` | `containerGroups/{name}` | resource group | `handleGet` | `200` full container group body, always including `instanceView` — see [the `$expand` correction](container-instances-resource-model.md#instanceview-and-expand) |
 | `PATCH` | `containerGroups/{name}` | resource group | `handleUpdateTags` | `200` full container group body |
 | `DELETE` | `containerGroups/{name}` | resource group | `handleDelete` | `204` No Content, idempotent |
 | `POST` | `containerGroups/{name}/start` | resource group | `handleStart` | `204` No Content |

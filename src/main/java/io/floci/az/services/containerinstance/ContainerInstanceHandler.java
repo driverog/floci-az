@@ -209,7 +209,7 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
         if (tail.matches("containerGroups/[^/]+(?:[?].*)?")) {
             String name = segment(tail, 1);
             return switch (method) {
-                case "GET"    -> handleGet(sub, rg, name, expandsInstanceView(req));
+                case "GET"    -> handleGet(sub, rg, name);
                 case "PUT"    -> handleCreateOrUpdate(sub, rg, name, req);
                 case "PATCH"  -> handleUpdateTags(sub, rg, name, req);
                 case "DELETE" -> handleDelete(sub, rg, name);
@@ -425,9 +425,20 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
         return secrets;
     }
 
-    private Response handleGet(String sub, String rg, String name, boolean expandInstanceView) {
+    /**
+     * {@code ContainerGroups_Get} declares no {@code $expand} query parameter — unlike
+     * {@code Microsoft.Compute} — and the swagger's own {@code ContainerGroupsGet_Succeeded}
+     * example carries {@code instanceView}. It is therefore always rendered here; the Java
+     * management SDK's {@code ContainerGroup.state()} and {@code az container show --query
+     * instanceView.state} both read it from a plain Get. A client that does send
+     * {@code $expand=instanceView} gets the same body.
+     *
+     * <p>A <em>list</em> response still omits it, matching {@code ListResultContainerGroup} and
+     * the {@code ContainerGroupsList} example.</p>
+     */
+    private Response handleGet(String sub, String rg, String name) {
         return read(storageKey(sub, rg, name))
-                .map(group -> Response.ok(toArmResponse(group, expandInstanceView))
+                .map(group -> Response.ok(toArmResponse(group, true))
                         .type("application/json").build())
                 .orElseGet(() -> ContainerInstanceErrors.groupNotFound(name, rg));
     }
@@ -1102,11 +1113,6 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
 
     private static String newGroupId() {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-    }
-
-    private static boolean expandsInstanceView(AzureRequest req) {
-        String expand = queryParam(req, "$expand");
-        return expand != null && expand.toLowerCase(Locale.ROOT).contains("instanceview");
     }
 
     private static String queryParam(AzureRequest req, String name) {

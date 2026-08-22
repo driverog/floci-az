@@ -276,7 +276,7 @@ This is the guard against #106: a handler that forgets `routes()` fails here.
 | `GET {SUB_BASE}/containerGroups?api-version=2023-05-01` | 200 | `value.name` contains `demo-group` |
 | `GET {BASE}/containerGroups?api-version=2023-05-01` | 200 | `value.name` contains `demo-group` |
 | `PUT {BASE}/containerGroups/demo-group?...` with `MINIMAL` | 200 | `properties.provisioningState` equals `Succeeded` |
-| `GET {BASE}/containerGroups/demo-group?...` | 200 | `name` equals `demo-group`, `properties.instanceView` is null |
+| `GET {BASE}/containerGroups/demo-group?...` | 200 | `name` equals `demo-group`, `properties.instanceView.state` equals `Running` |
 | `GET {BASE}/containerGroups/demo-group?...&$expand=instanceView` | 200 | `properties.instanceView.state` equals `Running` |
 | `PATCH {BASE}/containerGroups/demo-group?...` with `{"tags":{"a":"b"}}` | 200 | `tags.a` equals `b` |
 | `POST {BASE}/containerGroups/demo-group/start?...` | 204 | body is empty |
@@ -402,14 +402,19 @@ properties.containers[0].properties.instanceView.restartCount        == 0
 }
 ```
 
-### `getOmitsInstanceViewWithoutExpand`
+### `getIncludesInstanceViewWithoutExpand`
 
 **Arrange** — create `demo-group` with `FULL`.
 
 **Act** — `GET {groupUrl("demo-group")}`.
 
-**Assert** — `200`, `properties.instanceView` is null and
-`properties.containers[0].properties.instanceView` is null.
+**Assert** — `200`, `properties.instanceView.state` equals `Running` and
+`properties.containers[0].properties.instanceView.currentState.state` equals `Running`.
+
+`ContainerGroups_Get` has no `$expand` parameter in the `2023-05-01` contract, so the instance
+view is part of every single-resource Get — see
+[the correction in the resource model](container-instances-resource-model.md#instanceview-and-expand).
+`listOmitsInstanceView` below is the counterpart that still holds: a *list* response omits it.
 
 ### `getWithExpandInstanceViewIncludesState`
 

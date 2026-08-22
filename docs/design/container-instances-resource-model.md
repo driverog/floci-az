@@ -293,10 +293,30 @@ Zero or more than one volume kind on a single entry is `InvalidParameter` with t
 | `properties.instanceView.state` | string | One of `Pending`, `Running`, `Succeeded`, `Stopped`, `Failed` — see the [group state machine](container-instances-runtime.md#container-group-state-machine) |
 | `properties.instanceView.events` | array&lt;`Event`&gt; | Group-level events |
 
-Present in a `GET` response only when the query string contains
-`$expand` whose value, lowercased, contains `instanceview`. Always present in a `PUT` or `PATCH`
-response. Never present in a list response — matching the swagger's `ListResultContainerGroup`
-type, which the `ContainerGroupsList` example renders without `instanceView`.
+<a id="instanceview-and-expand"></a>
+
+Present in **every** `GET`, `PUT` and `PATCH` response for a single container group. Never
+present in a list response — matching the swagger's `ListResultContainerGroup` type, which the
+`ContainerGroupsList` example renders without `instanceView`.
+
+> **Correction (found during implementation).** An earlier revision of this document gated
+> `instanceView` on a `$expand=instanceView` query parameter, by analogy with
+> `Microsoft.Compute`. That is wrong for Container Instances and was corrected in the
+> implementation commit. Three pieces of evidence, all already inside this document set:
+>
+> - `ContainerGroups_Get` in `2023-05-01` declares **no** `$expand` parameter — the
+>   [global-parameters table](#global-parameters), transcribed from the swagger, lists only
+>   `subscriptionId`, `resourceGroupName`, `containerGroupName`, `containerName`, `location`,
+>   `api-version`, `tail` and `timestamps`.
+> - The swagger's own `ContainerGroupsGet_Succeeded.json` example, which this document models
+>   its Get response on, carries `instanceView`.
+> - The [test plan](container-instances-test-plan.md)'s own compatibility suites read it from a
+>   plain Get: the Java SDK's `ContainerGroup.state()` after `getByResourceGroup`, and
+>   `az container show --query instanceView.state`. Under the gating rule both return `null`.
+>
+> `$expand=instanceView` is still accepted and is a no-op, so a client that sends it — as the
+> [routing](container-instances-test-plan.md#routing) and [CRUD](container-instances-test-plan.md#crud)
+> cases do — receives the same body.
 
 ### `properties.containers[].properties.instanceView` (read-only)
 
@@ -779,8 +799,9 @@ registry `password` appears anywhere.
 
 `GET /subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/aci-rg/providers/Microsoft.ContainerInstance/containerGroups/demo-group?api-version=2023-05-01`
 
-`200 OK`. The body is the create response above **with both `instanceView` objects and all
-`events` arrays omitted** — `instanceView` is only rendered when `$expand` asks for it:
+`200 OK`. The body is the create response above, `instanceView` included. The body below is
+rendered without the instance views only to keep the example short; a real response carries
+them, exactly as the [`$expand=instanceView` example](#get-with-expandinstanceview) shows:
 
 ```json
 {
@@ -902,8 +923,9 @@ registry `password` appears anywhere.
 
 `GET /subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/aci-rg/providers/Microsoft.ContainerInstance/containerGroups/demo-group?api-version=2023-05-01&$expand=instanceView`
 
-`200 OK`. Identical to the **create response** body above, byte for byte, except that
-`provisioningState` and the state values reflect the current moment. The following body shows
+`200 OK`. `$expand` is accepted and ignored, so this is byte for byte the body a plain `GET`
+returns, and identical to the **create response** above except that `provisioningState` and the
+state values reflect the current moment. The following body shows
 the same group after the `web` container has crashed once and been restarted under
 `restartPolicy: Always`:
 

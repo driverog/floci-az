@@ -79,7 +79,7 @@ class ContainerInstanceRoutingTest {
         given().when().get(groupUrl("demo-group"))
                 .then().statusCode(200)
                 .body("name", equalTo("demo-group"))
-                .body("properties.instanceView", nullValue());
+                .body("properties.instanceView.state", equalTo("Running"));
 
         given().when().get(groupUrl("demo-group", "&$expand=instanceView"))
                 .then().statusCode(200)
