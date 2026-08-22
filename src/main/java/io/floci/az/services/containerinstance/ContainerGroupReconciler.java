@@ -169,7 +169,7 @@ public class ContainerGroupReconciler {
             if (record.isInit()) {
                 continue;
             }
-            changed |= reconcileContainer(group, record);
+            changed |= reconcileContainer(group, record, secrets);
         }
 
         GroupStateValue next = computeGroupState(group);
@@ -183,7 +183,8 @@ public class ContainerGroupReconciler {
     }
 
     /** Transitions C6, C7, C8, C9, C12, C14 and C15 for one app container. */
-    private boolean reconcileContainer(ContainerGroup group, ContainerRecord record) {
+    private boolean reconcileContainer(ContainerGroup group, ContainerRecord record,
+                                       GroupSecrets secrets) {
         if (record.getContainerId() == null) {
             return false;
         }
@@ -223,11 +224,11 @@ public class ContainerGroupReconciler {
             // C10, C11, C13 — the container has run to its policy's conclusion.
             return false;
         }
-        return restart(group, record);
+        return restart(group, record, secrets);
     }
 
     /** C9 / C12 followed immediately by C14 or C15. */
-    private boolean restart(ContainerGroup group, ContainerRecord record) {
+    private boolean restart(ContainerGroup group, ContainerRecord record, GroupSecrets secrets) {
         record.rememberCurrentAsPrevious();
         record.setRestartCount(record.getRestartCount() + 1);
         record.setState(ContainerStateValue.WAITING);
@@ -236,8 +237,22 @@ public class ContainerGroupReconciler {
         record.setExitCode(null);
         record.setFinishTime(null);
         try {
-            runtime.startContainer(record.getContainerId());
+            if (runtime.inspect(record.getContainerId()).exists()) {
+                runtime.startContainer(record.getContainerId());
+            } else {
+                // Removed out of band (C8). The recorded id names a container the daemon no
+                // longer has, so starting that id can never bring it back — it has to be
+                // re-created in the group's existing namespace.
+                runtime.recreateAppContainer(group, record, secrets);
+            }
             ContainerRuntimeState state = runtime.inspect(record.getContainerId());
+            if (!state.exists()) {
+                // ContainerLifecycleManager.start() logs and returns when the container is gone,
+                // so without this the record would be marked Running against nothing and the next
+                // tick would re-enter C8 — an endless restart loop that never recreates anything.
+                throw new IllegalStateException(
+                        "container is still absent after the start attempt");
+            }
             record.setState(ContainerStateValue.RUNNING);
             record.setStartTime(state.startedAt() != null ? state.startedAt() : Instant.now());
             ContainerGroupRuntime.appendEvent(record.getEvents(), "Started",

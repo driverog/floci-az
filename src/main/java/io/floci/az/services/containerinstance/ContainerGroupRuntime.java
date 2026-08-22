@@ -742,6 +742,27 @@ public class ContainerGroupRuntime {
         lifecycleManager.start(containerId);
     }
 
+    /**
+     * Re-creates one app container in the group's existing namespace, updating the record with
+     * the new container id. The reconciler needs this when a container is removed out of band:
+     * the infra container is still healthy, so {@link #repairInfra} does not run, and the
+     * recorded id names a container the daemon no longer has.
+     *
+     * @return whether the group's spec still declares a container by that name
+     */
+    public boolean recreateAppContainer(ContainerGroup group, ContainerRecord record,
+                                        GroupSecrets secrets) {
+        for (Map<String, Object> container : containerEntries(group, "containers")) {
+            String name = String.valueOf(container.get("name"));
+            if (!name.equals(record.getName())) {
+                continue;
+            }
+            createAppContainer(group, container, secrets, appName(group, name), record);
+            return true;
+        }
+        return false;
+    }
+
     // ── Logs ───────────────────────────────────────────────────────────────────────────────
 
     /**

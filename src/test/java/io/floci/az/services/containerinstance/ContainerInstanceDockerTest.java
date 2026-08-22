@@ -675,6 +675,47 @@ class ContainerInstanceDockerTest {
     // ── Out-of-band removal and secret custody ─────────────────────────────────────────────
 
     /**
+     * A container removed out of band while the infra container is still healthy. Because the
+     * namespace owner is alive, {@code repairInfra} never runs, and the recorded id names a
+     * container the daemon no longer has — so starting that id can never bring it back. The
+     * reconciler used to try exactly that every tick, incrementing {@code restartCount} and
+     * appending a {@code Failed} event forever without recreating anything. The container must
+     * come back under a new id, and the namespace owner must be left alone.
+     */
+    @Test
+    @Order(22)
+    void containerRemovedOutOfBandIsRecreated() {
+        create("orphan-group", FULL, 201);
+        await("orphan-group Running", () ->
+                "Running".equals(view("orphan-group").getString("properties.instanceView.state")));
+        String groupId = dockerGroupId("orphan-group");
+        assertNotNull(groupId, "could not read the group id from the container labels");
+
+        String webName = "floci-az-aci-" + groupId + "-web";
+        String infraName = "floci-az-aci-" + groupId + "-infra";
+        String removedId = lifecycleManager.findByName(webName)
+                .orElseThrow(() -> new AssertionError("no container named " + webName)).getId();
+        String infraId = lifecycleManager.findByName(infraName)
+                .orElseThrow(() -> new AssertionError("no container named " + infraName)).getId();
+
+        lifecycleManager.getDockerClient().removeContainerCmd(removedId).withForce(true).exec();
+
+        await("the removed container was recreated under a new id", () ->
+                lifecycleManager.findByName(webName)
+                        .map(container -> !removedId.equals(container.getId()))
+                        .orElse(false));
+        await("the recreated container reports Running", () -> "Running".equals(view("orphan-group")
+                .getString("properties.containers[0].properties.instanceView.currentState.state")));
+
+        // A single-container repair, not a G14 namespace rebuild: the owner keeps its identity,
+        // so the sidecar's namespace — and every host port binding — survives untouched.
+        assertEquals(infraId, lifecycleManager.findByName(infraName)
+                .orElseThrow(() -> new AssertionError("the infra container disappeared")).getId());
+        assertEquals("Running", view("orphan-group").getString("properties.instanceView.state"));
+        slow().when().delete(groupUrl("orphan-group")).then().statusCode(204);
+    }
+
+    /**
      * Secret custody follows the persisted spec, not the success of the call that supplied it.
      * Retaining the new secrets only after a successful create left the previous incarnation's
      * values behind when a replacement failed, and a later repair would have injected those into
