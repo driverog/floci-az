@@ -93,5 +93,12 @@ nav:
     - Azure Monitor / Log Analytics: services/monitor.md
     - Communication Services Email: services/email.md
     - Managed Identity: services/managed-identity.md
+  - Design:
+    - Container Instances: design/container-instances-index.md
+    - Container Instances — Design: design/container-instances.md
+    - Container Instances — Resource Model: design/container-instances-resource-model.md
+    - Container Instances — Runtime and State: design/container-instances-runtime.md
+    - Container Instances — Test Plan: design/container-instances-test-plan.md
+    - Container Instances — Roadmap: design/container-instances-roadmap.md
   - Contributing: contributing.md
   - Changelog: changelog.md
