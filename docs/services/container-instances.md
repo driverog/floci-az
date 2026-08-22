@@ -28,8 +28,9 @@ different one.
   subscription. `instanceView` is returned on every single-resource response; `$expand` is
   accepted and ignored
 - **Actions** — `start`, `stop`, `restart`, all synchronous and terminal
-- **Logs** — `GET .../containers/{container}/logs` with `tail` and `timestamps`, bounded by the
-  configured byte and line caps
+- **Logs** — `GET .../containers/{container}/logs` with `tail` and `timestamps`. The configured
+  byte and line caps bound the response from the *end* of the log, as Azure's own limits do, so
+  a container that has outrun its cap returns its most recent output rather than its first
 - **instanceView** — group `state` plus per-container `currentState`, `previousState`,
   `restartCount`, and `events`
 - **Restart policy** — `Always`, `OnFailure`, `Never`, with the emulator (not Docker) owning the

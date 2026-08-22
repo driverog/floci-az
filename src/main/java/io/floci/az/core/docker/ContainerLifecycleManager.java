@@ -32,6 +32,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,8 +40,6 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Manages Docker container lifecycle operations including create, start, stop, remove,
@@ -517,10 +516,11 @@ public class ContainerLifecycleManager {
      * Reads a container's logs without following, stopping as soon as either cap is reached.
      *
      * <p>Both streams are read and interleaved in the order the daemon recorded them, matching
-     * {@code docker logs}. The read never buffers more than {@code maxBytes} of log text: the
-     * result callback is closed from within its own {@code onNext}, which terminates the
-     * underlying HTTP stream, so a container producing gigabytes of output costs a bounded
-     * amount of heap.</p>
+     * {@code docker logs}. What comes back is the <em>end</em> of the log, which is what Azure's
+     * caps describe: the daemon is asked for the last {@code maxLines} lines, and the byte cap is
+     * then applied by discarding the oldest content, never the newest. A container producing
+     * gigabytes of output still costs a bounded amount of heap — frames are evicted from the
+     * front as they arrive, so no more than the cap plus one frame is ever held.</p>
      *
      * <p>A stopped container's logs are still available; a removed container has none. Docker
      * retains logs subject to the container's log-driver rotation settings — floci-az containers
@@ -529,74 +529,157 @@ public class ContainerLifecycleManager {
      *
      * @param containerId the container id or name
      * @param tail        number of lines to read from the end of the merged stream, or
-     *                    {@code null} for all available lines
+     *                    {@code null} for as many as the caps allow
      * @param timestamps  when true, each line is prefixed with an RFC 3339 nanosecond UTC
      *                    timestamp and a single space, exactly as {@code docker logs --timestamps}
      *                    emits it
-     * @param maxBytes    hard cap on the number of UTF-8 characters accumulated; the read stops
-     *                    at the first frame that would exceed it, and that frame is discarded
-     * @param maxLines    hard cap on the number of newline characters accumulated; the read stops
-     *                    at the first frame that would exceed it, and that frame is discarded
+     * @param maxBytes    cap on the UTF-8 byte length of the returned content; when the log is
+     *                    longer, the most recent {@code maxBytes} are returned, beginning at a
+     *                    line boundary
+     * @param maxLines    cap on the number of lines returned, again counted from the end
      * @param timeout     maximum time to wait for the stream to complete
-     * @return the bounded log content and whether a cap cut it short
+     * @return the bounded log content and whether anything was held back
      * @throws com.github.dockerjava.api.exception.NotFoundException when no such container exists
      */
     public LogResult fetchLogs(String containerId, Integer tail, boolean timestamps,
                                long maxBytes, int maxLines, Duration timeout) {
-        StringBuilder sink = new StringBuilder();
-        AtomicInteger lines = new AtomicInteger();
-        AtomicBoolean truncated = new AtomicBoolean(false);
+        // An explicit `tail` narrows Azure's line cap; it never widens it.
+        int lineCap = tail != null ? Math.max(0, Math.min(tail, maxLines)) : maxLines;
+        boolean lineCapIsAzureCap = tail == null || tail > maxLines;
 
         LogContainerCmd cmd = dockerClient.logContainerCmd(containerId)
                 .withStdOut(true)
                 .withStdErr(true)
                 .withFollowStream(false)
                 .withTimestamps(timestamps);
-        if (tail == null) {
+        if (lineCap == Integer.MAX_VALUE) {
             cmd.withTailAll();
         } else {
-            cmd.withTail(tail);
+            // One line more than the budget. The daemon does the line bounding, but never reports
+            // how much it held back, so that extra line is the only evidence anything was cut.
+            cmd.withTail(lineCap + 1);
         }
 
+        LogSink sink = new LogSink(maxBytes);
         ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<>() {
             @Override
             public void onNext(Frame frame) {
-                if (truncated.get()) {
-                    return;
-                }
-                String text = new String(frame.getPayload(), StandardCharsets.UTF_8);
-                long newlines = text.chars().filter(c -> c == '\n').count();
-                if (sink.length() + text.length() > maxBytes || lines.get() + newlines > maxLines) {
-                    truncated.set(true);
-                    // Closing from inside onNext is what terminates the underlying HTTP stream;
-                    // accumulating everything and truncating afterwards would defeat the cap.
-                    try {
-                        close();
-                    } catch (IOException e) {
-                        LOG.debugv("Closing log stream for {0} after cap: {1}",
-                                containerId, e.getMessage());
-                    }
-                    return;
-                }
-                sink.append(text);
-                lines.addAndGet((int) newlines);
+                sink.accept(frame.getPayload());
             }
         };
 
+        boolean completed;
         try {
             cmd.exec(callback);
-            callback.awaitCompletion(timeout.toMillis(), TimeUnit.MILLISECONDS);
+            completed = callback.awaitCompletion(timeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("Interrupted reading logs for container " + containerId, ie);
         } finally {
+            // Closed before the content is read: on a timeout the consumer thread may still be
+            // delivering frames, and the sink must not be read while it is being written.
             try {
                 callback.close();
             } catch (IOException e) {
                 LOG.debugv("Error closing log callback for {0}: {1}", containerId, e.getMessage());
             }
         }
-        return new LogResult(sink.toString(), truncated.get());
+        if (!completed) {
+            LOG.warnv("Log read for container {0} did not complete within {1}ms; returning the "
+                    + "partial content read so far", containerId, timeout.toMillis());
+        }
+        return sink.result(lineCap, lineCapIsAzureCap, !completed);
+    }
+
+    /**
+     * A bounded, newest-wins accumulator for one container's log stream.
+     *
+     * <p>Azure's caps describe the most <em>recent</em> output, so this keeps the tail rather than
+     * the head: whole frames are evicted from the front as newer ones arrive, leaving at most the
+     * cap plus one frame, which {@link #result} trims exactly. Retaining raw bytes rather than
+     * decoded text is what makes the byte cap a byte cap instead of a UTF-16 char count, and it
+     * keeps a multi-byte character the daemon happened to split across a frame boundary from
+     * decoding into replacement characters on both sides.</p>
+     */
+    private static final class LogSink {
+
+        private final ArrayDeque<byte[]> frames = new ArrayDeque<>();
+        private final long maxBytes;
+        private long bytes;
+        private boolean dropped;
+
+        LogSink(long maxBytes) {
+            this.maxBytes = Math.max(0, maxBytes);
+        }
+
+        synchronized void accept(byte[] payload) {
+            if (payload == null || payload.length == 0) {
+                return;
+            }
+            // Copied, not retained: docker-java fills each frame from a buffer it reuses for the
+            // next read, so holding the array would leave every frame showing the last one's
+            // bytes by the time the stream ends.
+            frames.addLast(payload.clone());
+            bytes += payload.length;
+            while (!frames.isEmpty() && bytes - frames.peekFirst().length >= maxBytes) {
+                bytes -= frames.pollFirst().length;
+                dropped = true;
+            }
+        }
+
+        synchronized LogResult result(int lineCap, boolean lineCapIsAzureCap, boolean incomplete) {
+            byte[] joined = new byte[(int) bytes];
+            int at = 0;
+            for (byte[] frame : frames) {
+                System.arraycopy(frame, 0, joined, at, frame.length);
+                at += frame.length;
+            }
+
+            boolean truncated = dropped || incomplete;
+            int start = 0;
+            if (joined.length > maxBytes) {
+                start = (int) (joined.length - maxBytes);
+                truncated = true;
+            }
+            if (start > 0) {
+                // Never begin mid-line. Advancing past the next newline also puts the offset on a
+                // character boundary, so the decode below cannot split a multi-byte character.
+                int newline = indexOfNewline(joined, start);
+                start = newline < 0 ? joined.length : newline + 1;
+            }
+            for (int surplus = countLines(joined, start) - lineCap; surplus > 0; surplus--) {
+                int newline = indexOfNewline(joined, start);
+                if (newline < 0) {
+                    break;
+                }
+                start = newline + 1;
+                truncated |= lineCapIsAzureCap;
+            }
+            return new LogResult(
+                    new String(joined, start, joined.length - start, StandardCharsets.UTF_8),
+                    truncated);
+        }
+
+        /** Safe on raw UTF-8: 0x0A never appears as a continuation byte. */
+        private static int indexOfNewline(byte[] data, int from) {
+            for (int i = from; i < data.length; i++) {
+                if (data[i] == '\n') {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        private static int countLines(byte[] data, int from) {
+            int count = 0;
+            for (int i = from; i < data.length; i++) {
+                if (data[i] == '\n') {
+                    count++;
+                }
+            }
+            // A final line the container wrote without a trailing newline still counts.
+            return data.length > from && data[data.length - 1] != '\n' ? count + 1 : count;
+        }
     }
 
     /**

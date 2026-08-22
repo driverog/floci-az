@@ -9,6 +9,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.time.Duration;
@@ -136,6 +137,69 @@ class ContainerLifecycleManagerLogTest {
         assertTrue(result.truncated(), "a 5 MB log read under a 4 KB cap must report truncation");
         assertTrue(elapsedMs < TIMEOUT.toMillis(),
                 "the capped read must terminate the stream, not wait for the timeout");
+    }
+
+    /**
+     * Azure's caps describe the most recent output. Accumulating from the start of the stream and
+     * stopping at the cap returned a container's oldest output and none of what it had just
+     * written — on a busy container, startup noise instead of the crash being investigated.
+     */
+    @Test
+    void fetchLogsReturnsTheMostRecentOutput() throws Exception {
+        String id = runToCompletion("recent", "for i in $(seq 1 400); do echo \"line-$i\"; done");
+        String content = lifecycleManager.fetchLogs(id, null, false, 200L, 10_000, TIMEOUT)
+                .content();
+
+        assertTrue(content.contains("line-400"), "the newest line must survive: " + content);
+        assertFalse(content.contains("line-1\n"), "the oldest lines are the ones to drop: " + content);
+    }
+
+    /** The line cap counts from the end too, and dropping lines to reach it is a truncation. */
+    @Test
+    void fetchLogsLineCapKeepsTheNewestLines() throws Exception {
+        String id = runToCompletion("linecap", "for i in $(seq 1 50); do echo \"line-$i\"; done");
+        ContainerLifecycleManager.LogResult result =
+                lifecycleManager.fetchLogs(id, null, false, 1_000_000L, 5, TIMEOUT);
+
+        assertEquals(5, result.content().lines().count(), "expected 5 lines: " + result.content());
+        assertTrue(result.content().contains("line-50"), "the newest line must survive");
+        assertTrue(result.truncated(), "holding back 45 lines is a truncation");
+    }
+
+    /**
+     * The cap is a byte cap, and the config names it one. Measuring Java chars let three-byte
+     * UTF-8 output return roughly three times the configured bound.
+     */
+    @Test
+    void fetchLogsByteCapCountsUtf8BytesNotChars() throws Exception {
+        long maxBytes = 512L;
+        String id = runToCompletion("multibyte",
+                "for i in $(seq 1 200); do echo \"日本語テキスト-$i\"; done");
+        String content = lifecycleManager.fetchLogs(id, null, false, maxBytes, 10_000, TIMEOUT)
+                .content();
+
+        int bytes = content.getBytes(StandardCharsets.UTF_8).length;
+        assertTrue(bytes <= maxBytes, "content was " + bytes + " bytes against a " + maxBytes
+                + "-byte cap: " + content);
+        assertFalse(content.isBlank(), "the cap must still return the most recent output");
+    }
+
+    /**
+     * The daemon delivers one log entry as several frames, split at a fixed buffer size that no
+     * multi-byte character is obliged to respect. Decoding each frame on its own turned the
+     * character straddling the boundary into a replacement character on both sides.
+     */
+    @Test
+    void fetchLogsDoesNotCorruptCharactersSplitAcrossFrames() throws Exception {
+        String id = runToCompletion("frames",
+                "s=''; i=0; while [ $i -lt 600 ]; do s=\"$s日本語\"; i=$((i+1)); done; echo \"$s\"");
+        String content = lifecycleManager.fetchLogs(id, null, false, 1_000_000L, 10_000, TIMEOUT)
+                .content();
+
+        assertFalse(content.contains("�"),
+                "a character split across a frame boundary decoded to U+FFFD");
+        assertEquals(1800, content.strip().length(),
+                "every character of the 1800-character line must survive the frame boundaries");
     }
 
     @Test
