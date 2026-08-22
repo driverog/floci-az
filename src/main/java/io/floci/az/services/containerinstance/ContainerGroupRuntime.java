@@ -140,8 +140,9 @@ public class ContainerGroupRuntime {
     }
 
     public void forgetSecrets(String storageKey) {
+        // The lock deliberately outlives the secrets: dropping it here could hand a concurrent
+        // caller a fresh lock object while another thread still holds the old one.
         secretsByKey.remove(storageKey);
-        locksByKey.remove(storageKey);
     }
 
     public void forgetAllSecrets() {

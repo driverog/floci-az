@@ -182,11 +182,14 @@ class ContainerInstanceDockerTest {
                 view("always-group").getInt(
                         "properties.containers[0].properties.instanceView.restartCount") >= 2);
 
+        // The fixture exits the instant it starts, so under Always it spends most of its life
+        // Terminated between restarts. Sampling once races the reconciler; poll for the state
+        // instead, which asserts the same thing — that the container does come back up.
+        await("the restarted container reaches Running or Waiting", () -> List.of("Running", "Waiting")
+                .contains(view("always-group").getString(
+                        "properties.containers[0].properties.instanceView.currentState.state")));
+
         JsonPath view = view("always-group");
-        String current = view.getString(
-                "properties.containers[0].properties.instanceView.currentState.state");
-        assertTrue(List.of("Running", "Waiting").contains(current),
-                "expected Running or Waiting, got " + current);
         assertEquals("Terminated", view.getString(
                 "properties.containers[0].properties.instanceView.previousState.state"));
         assertEquals(0, (int) view.getInt(

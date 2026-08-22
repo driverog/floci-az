@@ -1083,12 +1083,17 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
                     LOG.warnv("Reset: failed to remove Docker resources for container group "
                             + "{0}: {1}", group.getName(), e.getMessage());
                 } finally {
+                    // The record must go while the lock is still held. Deferring it to the
+                    // storage.clear() below leaves a window in which a reconciler tick reads a
+                    // group whose infra container this loop has just removed and "repairs" it,
+                    // recreating every container after the reset was supposed to remove them.
+                    storage.delete(group.storageKey());
                     lock.unlock();
                 }
             }
-            runtime.forgetAllSecrets();
         }
         storage.clear();
+        runtime.forgetAllSecrets();
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────────────────
