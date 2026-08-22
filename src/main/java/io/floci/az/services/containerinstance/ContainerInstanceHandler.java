@@ -360,9 +360,13 @@ public class ContainerInstanceHandler implements AzureServiceHandler, Resettable
      * Azure does, which also answers 201/200 and reports the failure through the state.
      */
     private void provisionWithDocker(ContainerGroup group, GroupSecrets secrets, String key) {
+        // Custody transfers before provisioning is attempted, not after it succeeds. Remembering
+        // them afterwards leaves the previous incarnation's secrets in the map when a replacement
+        // PUT fails, and the reconciler's repair then injects those into the spec that has just
+        // replaced them — the new deployment silently running on the old credentials.
+        runtime.rememberSecrets(key, secrets);
         try {
             runtime.createGroup(group, secrets);
-            runtime.rememberSecrets(key, secrets);
         } catch (ContainerGroupRuntimeException e) {
             if (e.isDockerUnavailable()) {
                 LOG.errorv(e, "Docker unavailable for container group {0}; "

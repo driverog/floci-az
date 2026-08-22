@@ -2,6 +2,7 @@ package io.floci.az.services.containerinstance;
 
 import io.floci.az.core.docker.ContainerDetector;
 import io.floci.az.core.docker.ContainerLifecycleManager;
+import io.floci.az.services.containerinstance.ContainerInstanceModels.GroupSecrets;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
@@ -35,7 +36,9 @@ import static io.floci.az.services.containerinstance.ContainerInstanceFixtures.B
 import static io.floci.az.services.containerinstance.ContainerInstanceFixtures.FULL;
 import static io.floci.az.services.containerinstance.ContainerInstanceFixtures.LOCALHOST_PAIR;
 import static io.floci.az.services.containerinstance.ContainerInstanceFixtures.MINIMAL;
+import static io.floci.az.services.containerinstance.ContainerInstanceFixtures.RG;
 import static io.floci.az.services.containerinstance.ContainerInstanceFixtures.RUN_TO_COMPLETION;
+import static io.floci.az.services.containerinstance.ContainerInstanceFixtures.SUB;
 import static io.floci.az.services.containerinstance.ContainerInstanceFixtures.actionUrl;
 import static io.floci.az.services.containerinstance.ContainerInstanceFixtures.groupUrl;
 import static io.floci.az.services.containerinstance.ContainerInstanceFixtures.logsUrl;
@@ -64,6 +67,9 @@ class ContainerInstanceDockerTest {
 
     @Inject
     ContainerDetector containerDetector;
+
+    @Inject
+    ContainerGroupRuntime runtime;
 
     /** Pure filesystem check — safe to run before Quarkus is fully ready. */
     @BeforeAll
@@ -664,6 +670,49 @@ class ContainerInstanceDockerTest {
         await("reset removed every Docker resource", () ->
                 lifecycleManager.findByName("floci-az-aci-" + groupId + "-infra").isEmpty()
                         && lifecycleManager.findByName("floci-az-aci-" + groupId + "-web").isEmpty());
+    }
+
+    // ── Out-of-band removal and secret custody ─────────────────────────────────────────────
+
+    /**
+     * Secret custody follows the persisted spec, not the success of the call that supplied it.
+     * Retaining the new secrets only after a successful create left the previous incarnation's
+     * values behind when a replacement failed, and a later repair would have injected those into
+     * the spec that had just replaced them — the new deployment silently running on the old
+     * credentials.
+     */
+    @Test
+    @Order(23)
+    void failedReplacementReplacesTheRetainedSecrets() {
+        create("rotation-group", FULL, 201);
+        String key = ContainerInstanceHandler.storageKey(SUB, RG, "rotation-group");
+        assertEquals("s3cr3t-token", retainedToken(key));
+
+        // A rotated secret alongside an image that does not exist: the previous incarnation is
+        // torn down, then provisioning fails on the pull. A missing image is a permanent pull
+        // failure, so this does not sit through the retry backoff.
+        String rotated = FULL
+                .replace("s3cr3t-token", "rotated-token")
+                .replace("\"image\": \"alpine:3.20\"",
+                        "\"image\": \"floci-az-nonexistent/does-not-exist:0\"");
+        String response = slow().contentType("application/json").body(rotated)
+                .when().put(groupUrl("rotation-group")).then().statusCode(200)
+                .extract().asString();
+        assertEquals("Failed",
+                JsonPath.from(response).getString("properties.provisioningState"));
+
+        assertEquals("rotated-token", retainedToken(key),
+                "the failed replacement left the previous incarnation's secret in custody");
+        slow().when().delete(groupUrl("rotation-group")).then().statusCode(204);
+    }
+
+    /** The secure environment value the runtime would inject into {@code web} on a repair. */
+    private String retainedToken(String key) {
+        GroupSecrets secrets = runtime.secrets(key);
+        assertNotNull(secrets, "no secrets retained for " + key);
+        return secrets.secureEnv()
+                .getOrDefault(ContainerGroupRuntime.secretEnvKey("web", false), Map.of())
+                .get("API_TOKEN");
     }
 }
 
