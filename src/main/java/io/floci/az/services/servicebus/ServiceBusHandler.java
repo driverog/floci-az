@@ -22,10 +22,15 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 /**
  * HTTP management handler for the Service Bus service.
@@ -64,6 +69,7 @@ import java.util.Optional;
 public class ServiceBusHandler implements AzureServiceHandler, Resettable {
 
     private static final Logger LOG = Logger.getLogger(ServiceBusHandler.class);
+    private static final int BROKER_ROLLBACK_ATTEMPTS = 3;
 
     private static final String ATOM_XML_CONTENT_TYPE = "application/atom+xml;charset=utf-8";
     private static final String XML_PROLOG = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
@@ -504,11 +510,11 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
                 .orElseGet(() -> notFoundAtom("Queue not found: " + queueName));
     }
 
-    private Response handleCreateQueue(String account, String namespace, String queueName,
-                                        boolean requiresSession,
-                                        ServiceBusEntityXml.DuplicateDetectionSettings duplicateDetection,
-                                        ServiceBusEntityXml.MessageLifetimeSettings lifetime,
-                                        ServiceBusEntityXml.DeliverySettings delivery) {
+    Response handleCreateQueue(String account, String namespace, String queueName,
+                                boolean requiresSession,
+                                ServiceBusEntityXml.DuplicateDetectionSettings duplicateDetection,
+                                ServiceBusEntityXml.MessageLifetimeSettings lifetime,
+                                ServiceBusEntityXml.DeliverySettings delivery) {
         String key = queueKey(account, namespace, queueName);
         if (store.get(key).isPresent()) {
             ServiceBusModels.QueueEntity existing =
@@ -592,7 +598,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
                 .orElseGet(() -> notFoundAtom("Topic not found: " + topicName));
     }
 
-    private Response handleCreateTopic(
+    Response handleCreateTopic(
             String account, String namespace, String topicName,
             ServiceBusEntityXml.DuplicateDetectionSettings duplicateDetection,
             ServiceBusEntityXml.MessageLifetimeSettings lifetime) {
@@ -692,11 +698,34 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
                 .orElseGet(() -> notFoundAtom("Subscription not found: " + subName));
     }
 
+    Response handleCreateSubscription(String account, String namespace,
+                                       String topicName, String subName,
+                                       boolean requiresSession, String body,
+                                       ServiceBusEntityXml.MessageLifetimeSettings lifetime,
+                                       ServiceBusEntityXml.DeliverySettings delivery) {
+        return handleCreateSubscription(account, namespace, topicName, subName,
+                requiresSession, lifetime, delivery,
+                () -> ServiceBusRuleXml.parseDefaultRule(topicName, subName, body)
+                        .orElseGet(() -> ServiceBusModels.RuleEntity.trueFilter(
+                                topicName, subName, "$Default")));
+    }
+
+    Response handleCreateSubscription(String account, String namespace,
+                                       String topicName, String subName,
+                                       boolean requiresSession,
+                                       ServiceBusEntityXml.MessageLifetimeSettings lifetime,
+                                       ServiceBusEntityXml.DeliverySettings delivery,
+                                       ServiceBusModels.RuleEntity initialRule) {
+        return handleCreateSubscription(account, namespace, topicName, subName,
+                requiresSession, lifetime, delivery, () -> initialRule);
+    }
+
     private Response handleCreateSubscription(String account, String namespace,
-                                                String topicName, String subName,
-                                                boolean requiresSession, String body,
-                                                ServiceBusEntityXml.MessageLifetimeSettings lifetime,
-                                                ServiceBusEntityXml.DeliverySettings delivery) {
+                                               String topicName, String subName,
+                                               boolean requiresSession,
+                                               ServiceBusEntityXml.MessageLifetimeSettings lifetime,
+                                               ServiceBusEntityXml.DeliverySettings delivery,
+                                               Supplier<ServiceBusModels.RuleEntity> initialRuleSupplier) {
         Optional<StoredObject> storedTopic = store.get(topicKey(account, namespace, topicName));
         if (storedTopic.isEmpty()) {
             return notFoundAtom("Topic not found: " + topicName);
@@ -711,11 +740,7 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
             return atomEntry(200, subscriptionEntryXml(namespace, existing));
         }
 
-        // A subscription starts with its initial rule: an explicit <DefaultRuleDescription>
-        // from the create body, or Azure's implicit $Default TrueFilter (accept everything).
-        ServiceBusModels.RuleEntity initialRule =
-                ServiceBusRuleXml.parseDefaultRule(topicName, subName, body)
-                        .orElseGet(() -> ServiceBusModels.RuleEntity.trueFilter(topicName, subName, "$Default"));
+        ServiceBusModels.RuleEntity initialRule = initialRuleSupplier.get();
         String selector;
         try {
             selector = ServiceBusRuleSelector.forRule(initialRule);
@@ -813,61 +838,144 @@ public class ServiceBusHandler implements AzureServiceHandler, Resettable {
     /** Creates or updates a rule, then re-applies the compiled selector to the Artemis queue. */
     private Response handlePutRule(AzureRequest req, String account, String namespace,
                                     String topicName, String subName, String ruleName) {
-        ServiceBusModels.RuleEntity rule =
-                ServiceBusRuleXml.parseRule(topicName, subName, ruleName, readBody(req));
+        return putRule(account, namespace,
+                ServiceBusRuleXml.parseRule(topicName, subName, ruleName, readBody(req)));
+    }
+
+    /** Stores a parsed rule and re-applies the compiled selector; 400 when it cannot compile. */
+    synchronized Response putRule(
+            String account, String namespace, ServiceBusModels.RuleEntity rule) {
         try {
             ServiceBusRuleSelector.forRule(rule);
         } catch (IllegalArgumentException e) {
             return badRequestAtom(e.getMessage());
         }
 
-        String key = ruleKey(account, namespace, topicName, subName, ruleName);
-        boolean existed = store.get(key).isPresent();
-        store.put(key, toStoredObject(key, rule));
-        warnOnActionIgnored(rule);
-        applySubscriptionFilter(account, namespace, topicName, subName);
+        String key = ruleKey(account, namespace, rule.topicName(), rule.subscriptionName(), rule.name());
+        Optional<StoredObject> previous = store.get(key);
+        List<ServiceBusModels.RuleEntity> desiredRules = new ArrayList<>(
+                loadRules(account, namespace, rule.topicName(), rule.subscriptionName()));
+        desiredRules.removeIf(existing -> existing.name().equals(rule.name()));
+        desiredRules.add(rule);
+        Response replacement = replaceRules(
+                account, namespace, rule.topicName(), rule.subscriptionName(), desiredRules);
+        if (replacement.getStatus() / 100 != 2) {
+            return replacement;
+        }
 
-        return atomEntry(existed ? 200 : 201, ruleEntryXml(namespace, rule));
+        return atomEntry(previous.isPresent() ? 200 : 201, ruleEntryXml(namespace, rule));
     }
 
-    private Response handleDeleteRule(String account, String namespace,
-                                       String topicName, String subName, String ruleName) {
+    synchronized Response handleDeleteRule(String account, String namespace,
+                                            String topicName, String subName, String ruleName) {
         String key = ruleKey(account, namespace, topicName, subName, ruleName);
-        if (store.get(key).isEmpty()) {
+        Optional<StoredObject> previous = store.get(key);
+        if (previous.isEmpty()) {
             return notFoundAtom("Rule not found: " + ruleName);
         }
-        store.delete(key);
-        applySubscriptionFilter(account, namespace, topicName, subName);
+        List<ServiceBusModels.RuleEntity> desiredRules = loadRules(account, namespace, topicName, subName)
+                .stream()
+                .filter(rule -> !rule.name().equals(ruleName))
+                .toList();
+        return replaceRules(account, namespace, topicName, subName, desiredRules);
+    }
+
+    /** Replaces a complete rule set in Artemis before committing matching management state. */
+    synchronized Response replaceRules(String account, String namespace,
+                                       String topicName, String subName,
+                                       List<ServiceBusModels.RuleEntity> rules) {
+        Map<String, ServiceBusModels.RuleEntity> desiredByName = new LinkedHashMap<>();
+        for (ServiceBusModels.RuleEntity rule : rules) {
+            desiredByName.put(rule.name(), rule);
+        }
+        List<ServiceBusModels.RuleEntity> desiredRules = List.copyOf(desiredByName.values());
+        String selector;
+        try {
+            selector = ServiceBusRuleSelector.forRules(desiredRules);
+        } catch (IllegalArgumentException e) {
+            return badRequestAtom(e.getMessage());
+        }
+
+        String prefix = rulePrefix(account, namespace, topicName, subName);
+        List<StoredObject> previousObjects = store.scan(key -> key.startsWith(prefix));
+        List<ServiceBusModels.RuleEntity> previousRules = deserializeRules(previousObjects);
+        String previousSelector;
+        try {
+            previousSelector = ServiceBusRuleSelector.forRules(previousRules);
+        } catch (IllegalArgumentException e) {
+            LOG.errorf(e, "Could not compile stored rules for subscription '%s/%s' in namespace '%s'",
+                    topicName, subName, namespace);
+            return errorAtom(500, "Failed to read the existing Service Bus rule state");
+        }
+        if (!applySubscriptionFilter(namespace, topicName, subName, selector)) {
+            return errorAtom(500, "Failed to apply rule filter to the Service Bus broker");
+        }
+
+        Map<String, StoredObject> desiredObjects = new LinkedHashMap<>();
+        for (ServiceBusModels.RuleEntity rule : desiredRules) {
+            String key = ruleKey(account, namespace, topicName, subName, rule.name());
+            desiredObjects.put(key, toStoredObject(key, rule));
+        }
+        Set<String> deletedKeys = previousObjects.stream()
+                .map(StoredObject::key)
+                .filter(key -> !desiredObjects.containsKey(key))
+                .collect(Collectors.toUnmodifiableSet());
+        try {
+            store.applyBatch(desiredObjects, deletedKeys);
+        } catch (RuntimeException e) {
+            LOG.errorf(e, "Failed to persist rules for subscription '%s/%s' in namespace '%s'",
+                    topicName, subName, namespace);
+            if (!restoreSubscriptionFilter(namespace, topicName, subName, previousSelector)) {
+                LOG.errorf("Could not restore the previous broker filter for subscription '%s/%s' "
+                                + "in namespace '%s' after rule storage failed; leaving the broker running "
+                                + "to preserve queued messages, but its filter may differ from stored rules",
+                        topicName, subName, namespace);
+            }
+            return errorAtom(500, "Failed to persist the Service Bus rule state");
+        }
+        desiredRules.forEach(ServiceBusHandler::warnOnActionIgnored);
         return Response.ok().build();
     }
 
-    private List<ServiceBusModels.RuleEntity> loadRules(String account, String namespace,
-                                                         String topicName, String subName) {
+    List<ServiceBusModels.RuleEntity> loadRules(String account, String namespace,
+                                                 String topicName, String subName) {
         String prefix = rulePrefix(account, namespace, topicName, subName);
-        return store.scan(k -> k.startsWith(prefix))
-                .stream()
+        return deserializeRules(store.scan(key -> key.startsWith(prefix)));
+    }
+
+    private List<ServiceBusModels.RuleEntity> deserializeRules(List<StoredObject> objects) {
+        return objects.stream()
                 .map(obj -> fromBytes(obj.data(), ServiceBusModels.RuleEntity.class))
                 .filter(r -> r != null)
                 .toList();
     }
 
-    /** Recompiles the subscription's rules and re-creates its Artemis queue with the new selector. */
-    private void applySubscriptionFilter(String account, String namespace,
-                                          String topicName, String subName) {
-        String selector;
-        try {
-            selector = ServiceBusRuleSelector.forRules(loadRules(account, namespace, topicName, subName));
-        } catch (IllegalArgumentException e) {
-            LOG.warnf("Cannot compile rules of subscription '%s/%s' to an Artemis filter: %s",
-                    topicName, subName, e.getMessage());
-            return;
-        }
+    /** Updates an Artemis subscription divert before its matching management state is committed. */
+    private boolean applySubscriptionFilter(String namespace, String topicName, String subName,
+                                             String selector) {
         try {
             namespaceManager.jolokiaUpdateSubscriptionFilter(namespace, topicName, subName, selector);
+            return true;
         } catch (Exception e) {
             LOG.warnf(e, "Failed to update filter of subscription '%s/%s' in Artemis for namespace '%s'",
                     topicName, subName, namespace);
+            return false;
         }
+    }
+
+    private boolean restoreSubscriptionFilter(String namespace, String topicName, String subName,
+                                              String selector) {
+        for (int attempt = 1; attempt <= BROKER_ROLLBACK_ATTEMPTS; attempt++) {
+            if (applySubscriptionFilter(namespace, topicName, subName, selector)) {
+                return true;
+            }
+            if (attempt < BROKER_ROLLBACK_ATTEMPTS) {
+                LOG.warnf("Retrying broker filter rollback for subscription '%s/%s' in namespace "
+                                + "'%s' after attempt %d of %d failed",
+                        topicName, subName, namespace, attempt, BROKER_ROLLBACK_ATTEMPTS);
+            }
+        }
+        return false;
     }
 
     private static void warnOnActionIgnored(ServiceBusModels.RuleEntity rule) {
