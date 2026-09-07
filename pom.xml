@@ -13,7 +13,11 @@
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <quarkus.platform.artifact-id>quarkus-bom</quarkus.platform.artifact-id>
         <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
-        <quarkus.platform.version>3.37.4</quarkus.platform.version>
+        <quarkus.platform.version>3.39.1</quarkus.platform.version>
+        <!-- Coupled to the Artemis sidecar image (application.yml *.artemis-image): the patched
+             artemis-amqp-protocol and proton-j jars built below replace the same-version jars inside
+             that image, so these two only move together with the image tag. Guarded by
+             ArtemisPatchVersionsTest; excluded from the dependabot group in .github/dependabot.yml. -->
         <artemis.version>2.44.0</artemis.version>
         <proton-j.version>0.34.1</proton-j.version>
         <skipITs>true</skipITs>
@@ -94,11 +98,17 @@
             <artifactId>commons-compress</artifactId>
             <version>1.28.0</version>
         </dependency>
+        <!-- GraalVM substitution annotations (see core/docker/graal); provided, never packaged. -->
+        <dependency>
+            <groupId>org.graalvm.sdk</groupId>
+            <artifactId>nativeimage</artifactId>
+            <scope>provided</scope>
+        </dependency>
         <!-- BouncyCastle for self-signed TLS cert generation (Artemis AMQP TLS) -->
         <dependency>
             <groupId>org.bouncycastle</groupId>
             <artifactId>bcprov-jdk18on</artifactId>
-            <version>1.85</version>
+            <version>1.85.2</version>
         </dependency>
         <dependency>
             <groupId>org.bouncycastle</groupId>
@@ -154,7 +164,7 @@
             </plugin>
             <plugin>
                 <artifactId>maven-dependency-plugin</artifactId>
-                <version>3.8.1</version>
+                <version>3.11.0</version>
                 <executions>
                     <execution>
                         <id>unpack-servicebus-proton-j</id>
@@ -219,7 +229,7 @@
             </plugin>
             <plugin>
                 <artifactId>maven-antrun-plugin</artifactId>
-                <version>3.1.0</version>
+                <version>3.2.0</version>
                 <executions>
                     <execution>
                         <id>patch-servicebus-artemis-amqp-sources</id>
@@ -354,6 +364,13 @@
                                     <fileset dir="${project.basedir}/src/artemis-plugin/resources" />
                                 </copy>
                                 <mkdir dir="${project.build.directory}/classes/artemis" />
+                                <!-- Single source of truth for the patch jar names and the sidecar lib
+                                     paths: the namespace managers read this file instead of hardcoding
+                                     the versions. -->
+                                <propertyfile file="${project.build.directory}/classes/artemis/patch-versions.properties">
+                                    <entry key="artemis.version" value="${artemis.version}" />
+                                    <entry key="proton-j.version" value="${proton-j.version}" />
+                                </propertyfile>
                                 <jar
                                     destfile="${project.build.directory}/classes/artemis/servicebus-artemis-extension.jar"
                                     basedir="${project.build.directory}/artemis-plugin-classes" />
