@@ -258,9 +258,16 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock   # required for PostgreSQL containers
 ```
 
-> **Sidecar ports:** PostgreSQL containers bind a random host port directly via the Docker
-> daemon. These ports are **not** published on the `floci-az` service — use
-> `FLOCI_AZ_SERVICES_POSTGRES_DEFAULT_PORT` (`0` = random) only if you need a fixed port.
+> **Sidecar ports:** PostgreSQL containers bind a host port directly via the Docker daemon;
+> these ports are **not** published on the `floci-az` service. With
+> `FLOCI_AZ_SERVICES_POSTGRES_DEFAULT_PORT=0` (the default) the OS assigns one per server.
+> Set it to a specific port and the **first** server to start binds exactly that port; any
+> further server, or a start when the port is already taken, falls back to an OS-assigned port
+> with a warning in the log. Availability is judged when the server starts, so a port that
+> something else grabs in the same instant fails the create like any other bind conflict. Read the real port from `properties.localPort` or
+> `/connect` rather than assuming. When floci-az itself runs in a container, the fixed port is
+> bound on the Docker host, while clients on the shared network still reach the sidecar by
+> container name on 5432.
 
 ---
 

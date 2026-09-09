@@ -361,9 +361,13 @@ services:
       # Do NOT add those ports here — floci-az manages them via Docker socket.
 ```
 
-> **Sidecar ports:** SQL Server containers bind a random host port directly via the Docker daemon.
-> These ports are **not** published on the `floci-az` service — add them to the `floci-az` service
-> only if you need a fixed port (use `FLOCI_AZ_SERVICES_SQL_DEFAULT_PORT`; `0` = random).
+> **Sidecar ports:** SQL Server containers bind a host port directly via the Docker daemon;
+> these ports are **not** published on the `floci-az` service. With
+> `FLOCI_AZ_SERVICES_SQL_DEFAULT_PORT=0` (the default) the OS assigns one per server. Set it to
+> a specific port and the **first** server to start binds exactly that port; any further server,
+> or a start when the port is already taken, falls back to an OS-assigned port with a warning in
+> the log. Availability is judged when the server starts, so a port that something else grabs in
+> the same instant fails the create like any other bind conflict. Read the real port from the server's connection details rather than assuming.
 
 ---
 

@@ -6,6 +6,7 @@ import io.floci.az.core.docker.ContainerBuilder;
 import io.floci.az.core.docker.ContainerDetector;
 import io.floci.az.core.docker.ContainerLifecycleManager;
 import io.floci.az.core.docker.ContainerSpec;
+import io.floci.az.core.docker.PortAllocator;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -33,8 +34,14 @@ public class MariaDbServerManager {
     @Inject ContainerLifecycleManager containerManager;
     @Inject ContainerBuilder containerBuilder;
     @Inject ContainerDetector containerDetector;
+    @Inject PortAllocator portAllocator;
 
     private final ConcurrentHashMap<String, String> managedContainers = new ConcurrentHashMap<>();
+
+
+    /** containerId -> the fixed host port claimed for it, so the claim is released with the container. */
+
+    private final ConcurrentHashMap<String, Integer> claimedPorts = new ConcurrentHashMap<>();
 
     public MariaDbState.ServerEntry startServer(MariaDbState.ServerEntry entry) {
         EmulatorConfig.MariaDbServiceConfig mariaConfig = config.services().mariaDb();
@@ -45,9 +52,25 @@ public class MariaDbServerManager {
 
         LOG.infof("Starting MariaDB container: server=%s image=%s", entry.serverName(), image);
 
+        // Pull before claiming, not after: create() pulls the image, and a cold pull of a large
+
+        // image would otherwise hold the port claimed but unbound for minutes, widening the
+
+        // window for something else to take it. The call is idempotent and free once cached.
+
+        containerManager.ensureImageAvailable(image);
+
+
+        int configuredPort = mariaConfig.defaultPort();
+        int requestedHostPort = portAllocator.claimOrZero(configuredPort);
+        if (configuredPort > 0 && requestedHostPort == 0) {
+            LOG.warnf("Configured MariaDB default-port %d is already claimed or in use - falling back "
+                + "to an OS-assigned host port for server=%s", configuredPort, entry.serverName());
+        }
+
         ContainerSpec spec = containerBuilder.newContainer(image)
             .withName(containerName)
-            .withDynamicPort(MARIADB_CONTAINER_PORT)
+            .withPortBinding(MARIADB_CONTAINER_PORT, requestedHostPort)   // 0 = OS picks (default-port unset or unavailable)
             .withDockerNetwork(config.services().dockerNetwork())
             .withEnv("MARIADB_ROOT_PASSWORD", entry.administratorLoginPassword())
             .withEnv("MARIADB_USER", entry.administratorLogin())
@@ -56,56 +79,102 @@ public class MariaDbServerManager {
             .withLogRotation()
             .build();
 
-        String containerId = containerManager.create(spec);
+        // Everything from here to the hand-off is inside the claim's ownership window: if it ends
+        // in a throw, nothing has taken responsibility for the port yet, so the finally gives it
+        // back. Guarding each individual step instead is what let this leak twice already.
+        boolean claimTransferred = false;
         try {
-            containerManager.copyFileToContainer(containerId, grantAdminSql(entry.administratorLogin()),
-                "/docker-entrypoint-initdb.d/10-grant-admin.sql");
-            var info = containerManager.startCreated(containerId, spec);
-
-            int hostPort = Optional.ofNullable(info.getEndpoint(MARIADB_CONTAINER_PORT))
-                .map(ContainerLifecycleManager.EndpointInfo::port)
-                .orElseThrow(() -> new RuntimeException(
-                    "Could not resolve host port for MariaDB container " + containerName));
-
-            String reachableHost;
-            int reachablePort;
-            if (containerDetector.isRunningInContainer()) {
-                reachableHost = containerName;
-                reachablePort = MARIADB_CONTAINER_PORT;
-            } else {
-                reachableHost = "localhost";
-                reachablePort = hostPort;
-            }
-
-            managedContainers.put(containerId, containerName);
-            LOG.infof("MariaDB container started: server=%s containerId=%s endpoint=%s:%d",
-                entry.serverName(), containerId, reachableHost, reachablePort);
-
-            waitForReady(reachableHost, reachablePort, mariaConfig.startupTimeoutSeconds());
-            LOG.infof("MariaDB server ready: server=%s endpoint=%s:%d",
-                entry.serverName(), reachableHost, reachablePort);
-
-            return entry.withContainer(containerId, reachablePort, reachableHost);
-        } catch (RuntimeException e) {
-            // The caller rolls back state that never learned this containerId, so a failed
-            // start must dispose of its own container or it leaks as a running orphan.
-            managedContainers.remove(containerId);
+            String containerId = containerManager.create(spec);
             try {
-                containerManager.stopAndRemove(containerId, null);
-            } catch (Exception cleanup) {
-                LOG.warnf(cleanup, "Failed to clean up MariaDB container %s after start failure",
-                    containerName);
+                containerManager.copyFileToContainer(containerId, grantAdminSql(entry.administratorLogin()),
+                    "/docker-entrypoint-initdb.d/10-grant-admin.sql");
+                var info = containerManager.startCreated(containerId, spec);
+
+                int hostPort = Optional.ofNullable(info.getEndpoint(MARIADB_CONTAINER_PORT))
+                    .map(ContainerLifecycleManager.EndpointInfo::port)
+                    .orElseThrow(() -> new RuntimeException(
+                        "Could not resolve host port for MariaDB container " + containerName));
+
+                String reachableHost;
+                int reachablePort;
+                if (containerDetector.isRunningInContainer()) {
+                    reachableHost = containerName;
+                    reachablePort = MARIADB_CONTAINER_PORT;
+                } else {
+                    reachableHost = "localhost";
+                    reachablePort = hostPort;
+                }
+
+                managedContainers.put(containerId, containerName);
+
+                // Record the port we claimed, not the one Docker reported: only a claimed port is
+                // reserved in the allocator, and only that one may be released later.
+                if (requestedHostPort > 0) {
+                    claimedPorts.put(containerId, requestedHostPort);
+                    claimTransferred = true;
+                }
+                LOG.infof("MariaDB container started: server=%s containerId=%s endpoint=%s:%d",
+                    entry.serverName(), containerId, reachableHost, reachablePort);
+
+                waitForReady(reachableHost, reachablePort, mariaConfig.startupTimeoutSeconds());
+                LOG.infof("MariaDB server ready: server=%s endpoint=%s:%d",
+                    entry.serverName(), reachableHost, reachablePort);
+
+                return entry.withContainer(containerId, reachablePort, reachableHost);
+            } catch (RuntimeException e) {
+                // The caller rolls back state that never learned this containerId, so a failed
+                // start must dispose of its own container or it leaks as a running orphan.
+                managedContainers.remove(containerId);
+                claimedPorts.remove(containerId);
+                claimTransferred = false;
+                try {
+                    containerManager.stopAndRemove(containerId, null);
+                } catch (Exception cleanup) {
+                    LOG.warnf(cleanup, "Failed to clean up MariaDB container %s after start failure",
+                        containerName);
+                }
+                throw e;
             }
-            throw e;
+        } finally {
+            if (!claimTransferred) {
+                releaseClaimedPort(requestedHostPort);
+            }
         }
+    }
+
+    /**
+
+     * Gives a claimed fixed port back so a later create can have it again. Takes the port
+
+     * rather than the containerId on purpose: a start that fails before the container is
+
+     * registered has nothing in the map, and looking it up there would leak the claim.
+
+     */
+
+    private void releaseClaimedPort(int claimedPort) {
+
+        if (claimedPort > 0) {
+
+            portAllocator.release(claimedPort);
+
+        }
+
     }
 
     public void stopServer(MariaDbState.ServerEntry entry) {
         if (entry.containerId() == null) return;
         LOG.infof("Stopping MariaDB container: server=%s containerId=%s",
             entry.serverName(), entry.containerId());
-        containerManager.stopAndRemove(entry.containerId(), null);
+        // Give the port and the bookkeeping back first: stopAndRemove can throw on a daemon
+        // hiccup, every caller swallows that, and the delete path has already dropped the
+        // server from state, so nothing would ever retry the release.
         managedContainers.remove(entry.containerId());
+        Integer claimed = claimedPorts.remove(entry.containerId());
+        if (claimed != null) {
+            releaseClaimedPort(claimed);
+        }
+        containerManager.stopAndRemove(entry.containerId(), null);
     }
 
     /**
@@ -192,5 +261,7 @@ public class MariaDbServerManager {
             }
         }
         managedContainers.clear();
+        claimedPorts.values().forEach(portAllocator::release);
+        claimedPorts.clear();
     }
 }

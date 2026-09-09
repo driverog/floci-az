@@ -6,6 +6,7 @@ import io.floci.az.core.docker.ContainerBuilder;
 import io.floci.az.core.docker.ContainerDetector;
 import io.floci.az.core.docker.ContainerLifecycleManager;
 import io.floci.az.core.docker.ContainerSpec;
+import io.floci.az.core.docker.PortAllocator;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -40,19 +41,25 @@ public class SqlServerManager {
     private final ContainerLifecycleManager containerManager;
     private final ContainerBuilder containerBuilder;
     private final ContainerDetector containerDetector;
+    private final PortAllocator portAllocator;
 
     /** containerId → container name, for cleanup on shutdown. */
     private final ConcurrentHashMap<String, String> managedContainers = new ConcurrentHashMap<>();
+
+    /** containerId -> the fixed host port claimed for it, so the claim is released with the container. */
+    private final ConcurrentHashMap<String, Integer> claimedPorts = new ConcurrentHashMap<>();
 
     @Inject
     public SqlServerManager(EmulatorConfig config,
                             ContainerLifecycleManager containerManager,
                             ContainerBuilder containerBuilder,
-                            ContainerDetector containerDetector) {
+                            ContainerDetector containerDetector,
+                            PortAllocator portAllocator) {
         this.config = config;
         this.containerManager = containerManager;
         this.containerBuilder = containerBuilder;
         this.containerDetector = containerDetector;
+        this.portAllocator = portAllocator;
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -76,67 +83,120 @@ public class SqlServerManager {
 
         LOG.infof("Starting SQL Server container: server=%s image=%s", entry.serverName(), image);
 
+        // Pull before claiming, not after: create() pulls the image, and a cold pull of a large
+
+        // image would otherwise hold the port claimed but unbound for minutes, widening the
+
+        // window for something else to take it. The call is idempotent and free once cached.
+
+        containerManager.ensureImageAvailable(image);
+
+
+        int configuredPort = sqlConfig.defaultPort();
+        int requestedHostPort = portAllocator.claimOrZero(configuredPort);
+        if (configuredPort > 0 && requestedHostPort == 0) {
+            LOG.warnf("Configured SQL Server default-port %d is already claimed or in use - falling back "
+                + "to an OS-assigned host port for server=%s", configuredPort, entry.serverName());
+        }
+
         ContainerSpec spec = containerBuilder.newContainer(image)
             .withName(containerName)
-            .withDynamicPort(SQL_CONTAINER_PORT)   // OS picks host port (used for host networking)
+            .withPortBinding(SQL_CONTAINER_PORT, requestedHostPort)   // 0 = OS picks (default-port unset or unavailable)
             .withDockerNetwork(config.services().dockerNetwork())  // join the shared network when running in Docker
             .withEnv("ACCEPT_EULA", "Y")
             .withEnv("MSSQL_SA_PASSWORD", password)
             .withLogRotation()
             .build();
 
-        var info = containerManager.createAndStart(spec);
-        String containerId = info.containerId();
-
-        int hostPort = Optional.ofNullable(info.getEndpoint(SQL_CONTAINER_PORT))
-            .map(ContainerLifecycleManager.EndpointInfo::port)
-            .orElseThrow(() -> new RuntimeException(
-                "Could not resolve host port for SQL Server container " + containerName));
-
-        // Pick the address an application can actually reach (mirrors RedisCacheManager):
-        // when floci-az runs inside a container, clients on the shared Docker network reach the
-        // sidecar by its container name on the container port; otherwise via localhost:hostPort.
-        String reachableHost;
-        int reachablePort;
-        if (containerDetector.isRunningInContainer()) {
-            reachableHost = containerName;
-            reachablePort = SQL_CONTAINER_PORT;
-        } else {
-            reachableHost = "localhost";
-            reachablePort = hostPort;
-        }
-
-        managedContainers.put(containerId, containerName);
-        LOG.infof("SQL Server container started: server=%s containerId=%s endpoint=%s:%d",
-            entry.serverName(), containerId, reachableHost, reachablePort);
-
+        // Everything from here to the hand-off is inside the claim's ownership window: if it ends
+        // in a throw, nothing has taken responsibility for the port yet, so the finally gives it
+        // back. Guarding each individual step instead is what let this leak twice already.
+        boolean claimTransferred = false;
         try {
-            waitForReady(reachableHost, reachablePort, sqlConfig.startupTimeoutSeconds());
-        } catch (RuntimeException startupFailure) {
-            managedContainers.remove(containerId);
-            try {
-                containerManager.stopAndRemove(containerId, null);
-            } catch (RuntimeException cleanupFailure) {
-                startupFailure.addSuppressed(cleanupFailure);
-                LOG.warnf(cleanupFailure,
-                    "Failed to remove unready SQL Server container '%s'", containerName);
-            }
-            throw startupFailure;
-        }
-        LOG.infof("SQL Server ready: server=%s endpoint=%s:%d", entry.serverName(), reachableHost, reachablePort);
+            var info = containerManager.createAndStart(spec);
+            String containerId = info.containerId();
 
-        return entry.withContainer(containerId, reachablePort, reachableHost);
+            int hostPort = Optional.ofNullable(info.getEndpoint(SQL_CONTAINER_PORT))
+                .map(ContainerLifecycleManager.EndpointInfo::port)
+                .orElseThrow(() -> new RuntimeException(
+                    "Could not resolve host port for SQL Server container " + containerName));
+
+            // Pick the address an application can actually reach (mirrors RedisCacheManager):
+            // when floci-az runs inside a container, clients on the shared Docker network reach the
+            // sidecar by its container name on the container port; otherwise via localhost:hostPort.
+            String reachableHost;
+            int reachablePort;
+            if (containerDetector.isRunningInContainer()) {
+                reachableHost = containerName;
+                reachablePort = SQL_CONTAINER_PORT;
+            } else {
+                reachableHost = "localhost";
+                reachablePort = hostPort;
+            }
+
+            managedContainers.put(containerId, containerName);
+
+            // Record the port we claimed, not the one Docker reported: only a claimed port is
+            // reserved in the allocator, and only that one may be released later.
+            if (requestedHostPort > 0) {
+                claimedPorts.put(containerId, requestedHostPort);
+                claimTransferred = true;
+            }
+            LOG.infof("SQL Server container started: server=%s containerId=%s endpoint=%s:%d",
+                entry.serverName(), containerId, reachableHost, reachablePort);
+
+            try {
+                waitForReady(reachableHost, reachablePort, sqlConfig.startupTimeoutSeconds());
+            } catch (RuntimeException startupFailure) {
+                managedContainers.remove(containerId);
+                claimedPorts.remove(containerId);
+                claimTransferred = false;
+                try {
+                    containerManager.stopAndRemove(containerId, null);
+                } catch (RuntimeException cleanupFailure) {
+                    startupFailure.addSuppressed(cleanupFailure);
+                    LOG.warnf(cleanupFailure,
+                        "Failed to remove unready SQL Server container '%s'", containerName);
+                }
+                throw startupFailure;
+            }
+            LOG.infof("SQL Server ready: server=%s endpoint=%s:%d", entry.serverName(), reachableHost, reachablePort);
+
+            return entry.withContainer(containerId, reachablePort, reachableHost);
+        } finally {
+            if (!claimTransferred) {
+                releaseClaimedPort(requestedHostPort);
+            }
+        }
     }
 
     /**
      * Stops and removes the container associated with the given server entry.
      */
+    /**
+     * Gives a claimed fixed port back so a later create can have it again. Takes the port
+     * rather than the containerId on purpose: a start that fails before the container is
+     * registered has nothing in the map, and looking it up there would leak the claim.
+     */
+    private void releaseClaimedPort(int claimedPort) {
+        if (claimedPort > 0) {
+            portAllocator.release(claimedPort);
+        }
+    }
+
     public void stopServer(SqlState.SqlServerEntry entry) {
         if (entry.containerId() == null) return;
         LOG.infof("Stopping SQL Server container: server=%s containerId=%s",
             entry.serverName(), entry.containerId());
-        containerManager.stopAndRemove(entry.containerId(), null);
+        // Give the port and the bookkeeping back first: stopAndRemove can throw on a daemon
+        // hiccup, every caller swallows that, and the delete path has already dropped the
+        // server from state, so nothing would ever retry the release.
         managedContainers.remove(entry.containerId());
+        Integer claimed = claimedPorts.remove(entry.containerId());
+        if (claimed != null) {
+            releaseClaimedPort(claimed);
+        }
+        containerManager.stopAndRemove(entry.containerId(), null);
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -221,6 +281,8 @@ public class SqlServerManager {
             }
         }
         managedContainers.clear();
+        claimedPorts.values().forEach(portAllocator::release);
+        claimedPorts.clear();
     }
 
     /** Thrown when the SQL Server EULA has not been explicitly accepted. */

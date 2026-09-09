@@ -6,6 +6,7 @@ import io.floci.az.core.docker.ContainerBuilder;
 import io.floci.az.core.docker.ContainerDetector;
 import io.floci.az.core.docker.ContainerLifecycleManager;
 import io.floci.az.core.docker.ContainerSpec;
+import io.floci.az.core.docker.PortAllocator;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -43,9 +44,13 @@ public class PostgresServerManager {
     @Inject ContainerLifecycleManager containerManager;
     @Inject ContainerBuilder containerBuilder;
     @Inject ContainerDetector containerDetector;
+    @Inject PortAllocator portAllocator;
 
     /** containerId → container name, for cleanup on shutdown. */
     private final ConcurrentHashMap<String, String> managedContainers = new ConcurrentHashMap<>();
+
+    /** containerId -> the fixed host port claimed for it, so the claim is released with the container. */
+    private final ConcurrentHashMap<String, Integer> claimedPorts = new ConcurrentHashMap<>();
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -64,9 +69,25 @@ public class PostgresServerManager {
 
         LOG.infof("Starting PostgreSQL container: server=%s image=%s", entry.serverName(), image);
 
+        // Pull before claiming, not after: create() pulls the image, and a cold pull of a large
+
+        // image would otherwise hold the port claimed but unbound for minutes, widening the
+
+        // window for something else to take it. The call is idempotent and free once cached.
+
+        containerManager.ensureImageAvailable(image);
+
+
+        int configuredPort = pgConfig.defaultPort();
+        int requestedHostPort = portAllocator.claimOrZero(configuredPort);
+        if (configuredPort > 0 && requestedHostPort == 0) {
+            LOG.warnf("Configured PostgreSQL default-port %d is already claimed or in use - falling back "
+                + "to an OS-assigned host port for server=%s", configuredPort, entry.serverName());
+        }
+
         ContainerSpec spec = containerBuilder.newContainer(image)
             .withName(containerName)
-            .withDynamicPort(PG_CONTAINER_PORT)   // OS picks host port (used for host networking)
+            .withPortBinding(PG_CONTAINER_PORT, requestedHostPort)   // 0 = OS picks (default-port unset or unavailable)
             .withDockerNetwork(config.services().dockerNetwork())  // join the shared network when running in Docker
             .withEnv("POSTGRES_USER", entry.administratorLogin())
             .withEnv("POSTGRES_PASSWORD", entry.administratorLoginPassword())
@@ -74,47 +95,91 @@ public class PostgresServerManager {
             .withLogRotation()
             .build();
 
-        var info = containerManager.createAndStart(spec);
-        String containerId = info.containerId();
+        // Everything from here to the hand-off is inside the claim's ownership window: if it ends
+        // in a throw, nothing has taken responsibility for the port yet, so the finally gives it
+        // back. Guarding each individual step instead is what let this leak twice already.
+        boolean claimTransferred = false;
+        try {
+            ContainerLifecycleManager.ContainerInfo info = containerManager.createAndStart(spec);
+            String containerId = info.containerId();
 
-        int hostPort = Optional.ofNullable(info.getEndpoint(PG_CONTAINER_PORT))
-            .map(ContainerLifecycleManager.EndpointInfo::port)
-            .orElseThrow(() -> new RuntimeException(
-                "Could not resolve host port for PostgreSQL container " + containerName));
+            int hostPort = Optional.ofNullable(info.getEndpoint(PG_CONTAINER_PORT))
+                .map(ContainerLifecycleManager.EndpointInfo::port)
+                .orElseThrow(() -> new RuntimeException(
+                    "Could not resolve host port for PostgreSQL container " + containerName));
 
-        // Pick the address an application can actually reach (mirrors RedisCacheManager):
-        // when floci-az runs inside a container, clients on the shared Docker network reach the
-        // sidecar by its container name on the container port; otherwise via localhost:hostPort.
-        String reachableHost;
-        int reachablePort;
-        if (containerDetector.isRunningInContainer()) {
-            reachableHost = containerName;
-            reachablePort = PG_CONTAINER_PORT;
-        } else {
-            reachableHost = "localhost";
-            reachablePort = hostPort;
+            // Pick the address an application can actually reach (mirrors RedisCacheManager):
+            // when floci-az runs inside a container, clients on the shared Docker network reach the
+            // sidecar by its container name on the container port; otherwise via localhost:hostPort.
+            String reachableHost;
+            int reachablePort;
+            if (containerDetector.isRunningInContainer()) {
+                reachableHost = containerName;
+                reachablePort = PG_CONTAINER_PORT;
+            } else {
+                reachableHost = "localhost";
+                reachablePort = hostPort;
+            }
+
+            managedContainers.put(containerId, containerName);
+
+            // Record the port we claimed, not the one Docker reported: only a claimed port is
+            // reserved in the allocator, and only that one may be released later.
+            if (requestedHostPort > 0) {
+                claimedPorts.put(containerId, requestedHostPort);
+                claimTransferred = true;
+            }
+            LOG.infof("PostgreSQL container started: server=%s containerId=%s endpoint=%s:%d",
+                entry.serverName(), containerId, reachableHost, reachablePort);
+
+            try {
+                waitForReady(reachableHost, reachablePort, pgConfig.startupTimeoutSeconds());
+            } catch (RuntimeException startupFailure) {
+                // The container itself is left for the pre-existing cleanup gap to deal with;
+                // the port claim is this method's to give back.
+                managedContainers.remove(containerId);
+                claimedPorts.remove(containerId);
+                claimTransferred = false;
+                throw startupFailure;
+            }
+            LOG.infof("PostgreSQL server ready: server=%s endpoint=%s:%d",
+                entry.serverName(), reachableHost, reachablePort);
+
+            return entry.withContainer(containerId, reachablePort, reachableHost);
+        } finally {
+            if (!claimTransferred) {
+                releaseClaimedPort(requestedHostPort);
+            }
         }
-
-        managedContainers.put(containerId, containerName);
-        LOG.infof("PostgreSQL container started: server=%s containerId=%s endpoint=%s:%d",
-            entry.serverName(), containerId, reachableHost, reachablePort);
-
-        waitForReady(reachableHost, reachablePort, pgConfig.startupTimeoutSeconds());
-        LOG.infof("PostgreSQL server ready: server=%s endpoint=%s:%d",
-            entry.serverName(), reachableHost, reachablePort);
-
-        return entry.withContainer(containerId, reachablePort, reachableHost);
     }
 
     /**
      * Stops and removes the container associated with the given server entry.
      */
+    /**
+     * Gives a claimed fixed port back so a later create can have it again. Takes the port
+     * rather than the containerId on purpose: a start that fails before the container is
+     * registered has nothing in the map, and looking it up there would leak the claim.
+     */
+    private void releaseClaimedPort(int claimedPort) {
+        if (claimedPort > 0) {
+            portAllocator.release(claimedPort);
+        }
+    }
+
     public void stopServer(PostgresState.ServerEntry entry) {
         if (entry.containerId() == null) return;
         LOG.infof("Stopping PostgreSQL container: server=%s containerId=%s",
             entry.serverName(), entry.containerId());
-        containerManager.stopAndRemove(entry.containerId(), null);
+        // Give the port and the bookkeeping back first: stopAndRemove can throw on a daemon
+        // hiccup, every caller swallows that, and the delete path has already dropped the
+        // server from state, so nothing would ever retry the release.
         managedContainers.remove(entry.containerId());
+        Integer claimed = claimedPorts.remove(entry.containerId());
+        if (claimed != null) {
+            releaseClaimedPort(claimed);
+        }
+        containerManager.stopAndRemove(entry.containerId(), null);
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -172,5 +237,7 @@ public class PostgresServerManager {
             }
         }
         managedContainers.clear();
+        claimedPorts.values().forEach(portAllocator::release);
+        claimedPorts.clear();
     }
 }
