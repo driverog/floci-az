@@ -49,6 +49,9 @@ public class AcrRegistryProxy {
     /** Response headers the emulator re-derives rather than copying from the backend. */
     private static final Set<String> REWRITTEN_RESPONSE_HEADERS = Set.of("location");
 
+    /** Methods that can carry a request body, and so may stream one of undeclared length. */
+    private static final Set<String> BODY_METHODS = Set.of("POST", "PUT", "PATCH");
+
     private static final String V2 = "v2/";
     private static final String CATALOG = "_catalog";
     private static final String TAGS_LIST = "/tags/list";
@@ -190,10 +193,14 @@ public class AcrRegistryProxy {
     }
 
     /**
-     * Streams the request body through with the length the client declared: layers are pushed whole
-     * and must not be buffered here. A request that declares no length carries no body worth
-     * streaming (or is chunked, which Docker never is), so it is buffered instead: {@code
-     * HttpClient} would otherwise have to chunk it, and the length is what frames a blob upload.
+     * Streams the request body through, never buffering it: a layer is pushed whole and would
+     * otherwise be held in memory in its entirety.
+     *
+     * <p>A declared {@code Content-Length} is carried over, because that length is what frames a
+     * blob upload. A body with no declared length is chunked, which the clients here do not do
+     * but an OCI client streaming a layer of unknown size may, and is forwarded chunked in turn.
+     * Only methods that can carry a body take that path; a bodyless {@code GET} or {@code DELETE}
+     * that simply declared no length must not acquire a chunked frame it never had.</p>
      *
      * <p>The supplier hands out the client's own stream, so it can only be subscribed to once. That
      * is safe because {@code HttpClient} retries only idempotent methods by default, and a blob
@@ -201,7 +208,7 @@ public class AcrRegistryProxy {
      * {@code jdk.httpclient.enableAllMethodRetry}: a retry would resubscribe to a stream that has
      * already been drained and push a truncated layer.</p>
      */
-    private static HttpRequest.BodyPublisher bodyPublisher(AzureRequest request) throws Exception {
+    private static HttpRequest.BodyPublisher bodyPublisher(AzureRequest request) {
         long length = declaredContentLength(request);
         if (length == 0 || request.bodyStream() == null) {
             return HttpRequest.BodyPublishers.noBody();
@@ -210,10 +217,10 @@ public class AcrRegistryProxy {
             return HttpRequest.BodyPublishers.fromPublisher(
                     HttpRequest.BodyPublishers.ofInputStream(request::bodyStream), length);
         }
-        byte[] body = request.bodyStream().readAllBytes();
-        return body.length == 0
-                ? HttpRequest.BodyPublishers.noBody()
-                : HttpRequest.BodyPublishers.ofByteArray(body);
+        if (!BODY_METHODS.contains(request.method())) {
+            return HttpRequest.BodyPublishers.noBody();
+        }
+        return HttpRequest.BodyPublishers.ofInputStream(request::bodyStream);
     }
 
     /** The client's {@code Content-Length}, or {@code -1} when it declared none. */

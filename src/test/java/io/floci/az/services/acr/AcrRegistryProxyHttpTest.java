@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -86,6 +87,59 @@ class AcrRegistryProxyHttpTest {
             assertEquals(String.valueOf(blob.length), receivedLength.get());
             // Query parameters survive the hop: the registry reads the digest it was sent.
             assertEquals("digest=sha256:abc", receivedQuery.get());
+        } finally {
+            registry.stop(0);
+        }
+    }
+
+    @Test
+    void streamsAnUploadThatDeclaredNoLengthInsteadOfBufferingIt() throws Exception {
+        // A client that streams a layer of unknown size sends it chunked. Forwarding it chunked in
+        // turn keeps it out of memory; reading it whole to re-declare a length would not.
+        byte[] blob = "a-layer-of-unknown-size".getBytes(StandardCharsets.UTF_8);
+        AtomicReference<String> receivedBody = new AtomicReference<>();
+        AtomicReference<String> receivedEncoding = new AtomicReference<>();
+        AtomicReference<String> receivedLength = new AtomicReference<>();
+        HttpServer registry = server(exchange -> {
+            receivedEncoding.set(exchange.getRequestHeaders().getFirst("Transfer-Encoding"));
+            receivedLength.set(exchange.getRequestHeaders().getFirst("Content-Length"));
+            receivedBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            exchange.sendResponseHeaders(202, -1);
+            exchange.close();
+        });
+
+        try {
+            AzureRequest request = request("PATCH", "v2/app/blobs/uploads/abc-123",
+                    new ByteArrayInputStream(blob), Map.of());
+
+            Response response = proxy(request, registry.getAddress().getPort());
+
+            assertEquals(202, response.getStatus());
+            assertEquals(new String(blob, StandardCharsets.UTF_8), receivedBody.get());
+            assertEquals("chunked", receivedEncoding.get());
+            assertNull(receivedLength.get(), "a chunked body declares no length");
+        } finally {
+            registry.stop(0);
+        }
+    }
+
+    @Test
+    void doesNotChunkABodylessRequestThatDeclaredNoLength() {
+        // A GET carries nothing to stream. Declaring no length must not turn it into a chunked
+        // request the client never made.
+        AtomicReference<String> receivedEncoding = new AtomicReference<>();
+        HttpServer registry = server(exchange -> {
+            receivedEncoding.set(exchange.getRequestHeaders().getFirst("Transfer-Encoding"));
+            exchange.sendResponseHeaders(200, -1);
+            exchange.close();
+        });
+
+        try {
+            AzureRequest request = request("GET", "v2/app/blobs/sha256:abc",
+                    new ByteArrayInputStream(new byte[0]), Map.of());
+
+            assertEquals(200, proxy(request, registry.getAddress().getPort()).getStatus());
+            assertNull(receivedEncoding.get());
         } finally {
             registry.stop(0);
         }
