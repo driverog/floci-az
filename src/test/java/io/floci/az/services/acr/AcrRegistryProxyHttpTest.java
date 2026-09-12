@@ -185,6 +185,24 @@ class AcrRegistryProxyHttpTest {
     }
 
     @Test
+    void catalogAnswersAnEmptyPageWithoutAskingTheContainer() {
+        AtomicReference<String> receivedQuery = new AtomicReference<>();
+        HttpServer registry = catalogServer(receivedQuery, "myreg/app", "myreg/web");
+
+        try {
+            Response response = proxy(request("GET", "v2/_catalog", null, Map.of(),
+                    Map.of("n", List.of("0"))), registry.getAddress().getPort());
+
+            assertEquals(200, response.getStatus());
+            assertEquals("{\"repositories\":[]}", new String((byte[]) response.getEntity()));
+            assertNull(response.getHeaderString("Link"));
+            assertNull(receivedQuery.get(), "a page of nothing needs no container request");
+        } finally {
+            registry.stop(0);
+        }
+    }
+
+    @Test
     void catalogPrefixesTheCursorTheClientSendsBack() {
         AtomicReference<String> receivedQuery = new AtomicReference<>();
         HttpServer registry = catalogServer(receivedQuery, "myreg/zebra", "otherreg/db");

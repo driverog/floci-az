@@ -1,5 +1,6 @@
 package io.floci.az.services.acr;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -52,6 +53,12 @@ public class AcrRegistryProxy {
 
     /** Methods that can carry a request body, and so may stream one of undeclared length. */
     private static final Set<String> BODY_METHODS = Set.of("POST", "PUT", "PATCH");
+
+    /** {@link #pageSize} for a client that asked for no pagination at all. */
+    static final int UNPAGINATED = -1;
+
+    /** How long the shared container has to answer one request. */
+    private static final Duration BACKEND_TIMEOUT = Duration.ofMinutes(5);
 
     private static final String V2 = "v2/";
     private static final String CATALOG = "_catalog";
@@ -124,15 +131,22 @@ public class AcrRegistryProxy {
         return repositories;
     }
 
-    /** The page size the client asked for, or {@code 0} when it asked for no pagination. */
+    /**
+     * The page size the client asked for, or {@link #UNPAGINATED} when it asked for none.
+     *
+     * <p>Zero is a request for an empty page, which is not the same as a request for the whole
+     * catalog, so the two do not collapse. A size that will not parse, or that is negative, is
+     * treated as absent.</p>
+     */
     static int pageSize(String declared) {
         if (declared == null || declared.isBlank()) {
-            return 0;
+            return UNPAGINATED;
         }
         try {
-            return Math.max(Integer.parseInt(declared.trim()), 0);
+            int declaredSize = Integer.parseInt(declared.trim());
+            return declaredSize < 0 ? UNPAGINATED : declaredSize;
         } catch (NumberFormatException e) {
-            return 0;
+            return UNPAGINATED;
         }
     }
 
@@ -179,32 +193,42 @@ public class AcrRegistryProxy {
         }
         URI target = URI.create("http://" + backendEndpoint + "/"
                 + backendPath(registryName, clientPath) + queryString(request));
-        boolean rewritten = rewritesBody(clientPath);
+        // Subscribed to at most once: only one of the branches below runs.
+        HttpRequest.BodyPublisher body = bodyPublisher(request);
         try {
-            HttpRequest.Builder outgoing = HttpRequest.newBuilder(target)
-                    .timeout(Duration.ofMinutes(5))
-                    .method(request.method(), bodyPublisher(request));
-            forwardRequestHeaders(request, outgoing);
-
             if ("HEAD".equals(request.method())) {
-                HttpResponse<Void> backend =
-                        httpClient.send(outgoing.build(), HttpResponse.BodyHandlers.discarding());
-                return response(backend, registryName, null, true);
+                return response(send(request, target, body, HttpResponse.BodyHandlers.discarding()),
+                        registryName, null, true);
             }
-            if (rewritten) {
+            if (rewritesBody(clientPath)) {
                 HttpResponse<byte[]> backend =
-                        httpClient.send(outgoing.build(), HttpResponse.BodyHandlers.ofByteArray());
+                        send(request, target, body, HttpResponse.BodyHandlers.ofByteArray());
                 return response(backend, registryName,
                         unprefixRepositoryName(registryName, backend.body()), false);
             }
             HttpResponse<InputStream> backend =
-                    httpClient.send(outgoing.build(), HttpResponse.BodyHandlers.ofInputStream());
+                    send(request, target, body, HttpResponse.BodyHandlers.ofInputStream());
             return response(backend, registryName, backend.body(), false);
         } catch (Exception e) {
-            LOG.warnv("ACR data-plane proxy to {0} failed: {1}", target, e.getMessage());
-            return AcrErrors.error(502, AcrErrors.UNAVAILABLE,
-                    "the registry data plane is unavailable: " + e.getMessage());
+            return unavailable(target, e);
         }
+    }
+
+    /** Forwards one request to the shared container, carrying the client's headers over. */
+    private <T> HttpResponse<T> send(AzureRequest request, URI target, HttpRequest.BodyPublisher body,
+                                     HttpResponse.BodyHandler<T> handler) throws Exception {
+        HttpRequest.Builder outgoing = HttpRequest.newBuilder(target)
+                .timeout(BACKEND_TIMEOUT)
+                .method(request.method(), body);
+        forwardRequestHeaders(request, outgoing);
+        return httpClient.send(outgoing.build(), handler);
+    }
+
+    /** The registry error for a container that could not be reached or did not answer. */
+    private static Response unavailable(URI target, Exception e) {
+        LOG.warnv("ACR data-plane request to {0} failed: {1}", target, e.getMessage());
+        return AcrErrors.error(502, AcrErrors.UNAVAILABLE,
+                "the registry data plane is unavailable: " + e.getMessage());
     }
 
     /**
@@ -229,51 +253,47 @@ public class AcrRegistryProxy {
     private Response catalog(AzureRequest request, String registryName, String backendEndpoint) {
         String prefix = registryName + "/";
         int pageSize = pageSize(firstQueryValue(request, "n"));
-        String clientLast = firstQueryValue(request, "last");
-        String backendLast = prefix + (clientLast == null ? "" : clientLast);
-
-        StringBuilder query = new StringBuilder("?last=").append(encode(backendLast));
-        if (pageSize > 0) {
-            query.append("&n=").append((long) pageSize + 1);
-        }
-        URI target = URI.create("http://" + backendEndpoint + "/" + V2 + CATALOG + query);
+        URI target = catalogTarget(backendEndpoint, prefix, firstQueryValue(request, "last"), pageSize);
         try {
-            HttpRequest.Builder outgoing = HttpRequest.newBuilder(target)
-                    .timeout(Duration.ofMinutes(5))
-                    .method(request.method(), HttpRequest.BodyPublishers.noBody());
-            forwardRequestHeaders(request, outgoing);
-            HttpResponse<byte[]> backend =
-                    httpClient.send(outgoing.build(), HttpResponse.BodyHandlers.ofByteArray());
+            if (pageSize == 0) {
+                // A page of nothing is what was asked for, so there is nothing to ask the container.
+                return catalogPage(List.of(), false, pageSize);
+            }
+            HttpResponse<byte[]> backend = send(request, target,
+                    HttpRequest.BodyPublishers.noBody(), HttpResponse.BodyHandlers.ofByteArray());
             if (backend.statusCode() != 200) {
                 return response(backend, registryName, backend.body(), false);
             }
 
             List<String> repositories = ownRepositories(prefix, backend.body());
             boolean more = pageSize > 0 && repositories.size() > pageSize;
-            if (more) {
-                repositories = repositories.subList(0, pageSize);
-            }
-            Response.ResponseBuilder page = Response.ok(catalogBody(repositories))
-                    .type(MediaType.APPLICATION_JSON);
-            if (more) {
-                page.header("Link", nextLink(repositories.get(repositories.size() - 1), pageSize));
-            }
-            return page.build();
+            return catalogPage(more ? repositories.subList(0, pageSize) : repositories, more, pageSize);
         } catch (Exception e) {
-            LOG.warnv("ACR catalog request to {0} failed: {1}", target, e.getMessage());
-            return AcrErrors.error(502, AcrErrors.UNAVAILABLE,
-                    "the registry data plane is unavailable: " + e.getMessage());
+            return unavailable(target, e);
         }
     }
 
-    /** The catalog response body. An unserialisable list is reported as an empty catalog. */
-    private static byte[] catalogBody(List<String> repositories) {
-        try {
-            return MAPPER.writeValueAsBytes(Map.of("repositories", repositories));
-        } catch (Exception e) {
-            LOG.debugv("Could not write the registry catalog: {0}", e.getMessage());
-            return "{\"repositories\":[]}".getBytes(StandardCharsets.UTF_8);
+    /** The container request behind one catalog page: this registry's range, one repository over. */
+    private static URI catalogTarget(String backendEndpoint, String prefix, String clientLast,
+                                     int pageSize) {
+        StringBuilder query = new StringBuilder("?last=")
+                .append(encode(prefix + (clientLast == null ? "" : clientLast)));
+        if (pageSize > 0) {
+            query.append("&n=").append((long) pageSize + 1);
         }
+        return URI.create("http://" + backendEndpoint + "/" + V2 + CATALOG + query);
+    }
+
+    /** One catalog page, carrying the cursor to the next only when this registry has more. */
+    private static Response catalogPage(List<String> repositories, boolean more, int pageSize)
+            throws JsonProcessingException {
+        Response.ResponseBuilder page = Response
+                .ok(MAPPER.writeValueAsBytes(Map.of("repositories", repositories)))
+                .type(MediaType.APPLICATION_JSON);
+        if (more) {
+            page.header("Link", nextLink(repositories.get(repositories.size() - 1), pageSize));
+        }
+        return page.build();
     }
 
     /** The first value of a query parameter, or {@code null} when the client sent none. */

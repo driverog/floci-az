@@ -8,6 +8,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -94,11 +95,19 @@ class AcrRegistryProxyTest {
 
     @Test
     void aPageSizeIsReadOnlyWhenTheClientAskedForOne() {
-        assertEquals(0, AcrRegistryProxy.pageSize(null));
-        assertEquals(0, AcrRegistryProxy.pageSize(""));
-        assertEquals(0, AcrRegistryProxy.pageSize("not-a-number"));
-        assertEquals(0, AcrRegistryProxy.pageSize("-4"));
+        assertEquals(AcrRegistryProxy.UNPAGINATED, AcrRegistryProxy.pageSize(null));
+        assertEquals(AcrRegistryProxy.UNPAGINATED, AcrRegistryProxy.pageSize(""));
+        assertEquals(AcrRegistryProxy.UNPAGINATED, AcrRegistryProxy.pageSize("not-a-number"));
+        assertEquals(AcrRegistryProxy.UNPAGINATED, AcrRegistryProxy.pageSize("-4"));
         assertEquals(10, AcrRegistryProxy.pageSize(" 10 "));
+    }
+
+    @Test
+    void askingForNoRepositoriesIsNotAskingForAllOfThem() {
+        // n=0 and no n at all used to collapse to the same answer, which handed a client that
+        // asked for an empty page the entire catalog.
+        assertEquals(0, AcrRegistryProxy.pageSize("0"));
+        assertNotEquals(AcrRegistryProxy.pageSize("0"), AcrRegistryProxy.pageSize(null));
     }
 
     @Test
