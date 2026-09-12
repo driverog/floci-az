@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.az.core.AzureRequest;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
@@ -96,37 +97,48 @@ public class AcrRegistryProxy {
 
     /** True when the response body names repositories and must be translated to the client's view. */
     static boolean rewritesBody(String clientPath) {
-        return clientPath.equals(V2 + CATALOG) || clientPath.endsWith(TAGS_LIST);
-    }
-
-    /** Translates a response body that names repositories back to the client's view. */
-    static byte[] rewriteBody(String registryName, String clientPath, byte[] body) {
-        if (clientPath.equals(V2 + CATALOG)) {
-            return filterCatalog(registryName, body);
-        }
-        return unprefixRepositoryName(registryName, body);
+        return clientPath.endsWith(TAGS_LIST);
     }
 
     /**
-     * Rewrites {@code /v2/_catalog} to this registry's own view: only its repositories, with the
-     * internal prefix removed.
+     * This registry's repositories, in the order the container reported them, with the internal
+     * prefix removed.
+     *
+     * <p>Reading stops at the first repository outside the prefix. The container walks the
+     * repository directory tree, so one registry's repositories are a subtree and therefore
+     * contiguous: the first outsider ends this registry's block, and nothing of ours follows it.</p>
      */
-    static byte[] filterCatalog(String registryName, byte[] body) {
+    static List<String> ownRepositories(String prefix, byte[] body) {
+        List<String> repositories = new ArrayList<>();
         try {
-            JsonNode root = MAPPER.readTree(body);
-            List<String> repositories = new ArrayList<>();
-            String prefix = registryName + "/";
-            for (JsonNode repository : root.path("repositories")) {
+            for (JsonNode repository : MAPPER.readTree(body).path("repositories")) {
                 String name = repository.asText("");
-                if (name.startsWith(prefix)) {
-                    repositories.add(name.substring(prefix.length()));
+                if (!name.startsWith(prefix)) {
+                    break;
                 }
+                repositories.add(name.substring(prefix.length()));
             }
-            return MAPPER.writeValueAsBytes(Map.of("repositories", repositories));
         } catch (Exception e) {
-            LOG.debugv("Could not filter the registry catalog: {0}", e.getMessage());
-            return body;
+            LOG.debugv("Could not read the registry catalog: {0}", e.getMessage());
         }
+        return repositories;
+    }
+
+    /** The page size the client asked for, or {@code 0} when it asked for no pagination. */
+    static int pageSize(String declared) {
+        if (declared == null || declared.isBlank()) {
+            return 0;
+        }
+        try {
+            return Math.max(Integer.parseInt(declared.trim()), 0);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /** The {@code Link} advertising the next page, in the shape the registry itself uses. */
+    static String nextLink(String last, int pageSize) {
+        return "</" + V2 + CATALOG + "?last=" + encode(last) + "&n=" + pageSize + ">; rel=\"next\"";
     }
 
     /**
@@ -162,6 +174,9 @@ public class AcrRegistryProxy {
      */
     public Response proxy(AzureRequest request, String registryName, String backendEndpoint) {
         String clientPath = trimLeadingSlash(request.rawPath());
+        if (clientPath.equals(V2 + CATALOG)) {
+            return catalog(request, registryName, backendEndpoint);
+        }
         URI target = URI.create("http://" + backendEndpoint + "/"
                 + backendPath(registryName, clientPath) + queryString(request));
         boolean rewritten = rewritesBody(clientPath);
@@ -180,7 +195,7 @@ public class AcrRegistryProxy {
                 HttpResponse<byte[]> backend =
                         httpClient.send(outgoing.build(), HttpResponse.BodyHandlers.ofByteArray());
                 return response(backend, registryName,
-                        rewriteBody(registryName, clientPath, backend.body()), false);
+                        unprefixRepositoryName(registryName, backend.body()), false);
             }
             HttpResponse<InputStream> backend =
                     httpClient.send(outgoing.build(), HttpResponse.BodyHandlers.ofInputStream());
@@ -190,6 +205,85 @@ public class AcrRegistryProxy {
             return AcrErrors.error(502, AcrErrors.UNAVAILABLE,
                     "the registry data plane is unavailable: " + e.getMessage());
         }
+    }
+
+    /**
+     * Serves {@code /v2/_catalog} as this registry's own catalog, one backend request per page.
+     *
+     * <p>The container has no filter parameter: the catalog's whole query vocabulary is {@code n}
+     * and {@code last}. The filter is therefore expressed as a range, which works because a
+     * registry's repositories are a contiguous subtree of the container's walk. Seeding
+     * {@code last} with {@code {registry}/} lands exactly on the first of ours, so {@code n} then
+     * counts ours rather than everyone's and a page comes back full.</p>
+     *
+     * <p>One extra repository is requested beyond the page. The container advertises a next page
+     * whenever the page it returned was full, not when more results actually exist, so its
+     * {@code Link} cannot say whether this registry has more. That extra entry can: outside the
+     * prefix it means the block ended here, and the page is the last one.</p>
+     *
+     * <p>Verified against {@code registry:2} (Distribution 2.8.3). {@code last} is a position in
+     * that walk rather than a repository that has to exist, which is what lets the seed name
+     * nothing. None of this is in the distribution spec, so
+     * {@code AcrCatalogPaginationDockerTest} pins it.</p>
+     */
+    private Response catalog(AzureRequest request, String registryName, String backendEndpoint) {
+        String prefix = registryName + "/";
+        int pageSize = pageSize(firstQueryValue(request, "n"));
+        String clientLast = firstQueryValue(request, "last");
+        String backendLast = prefix + (clientLast == null ? "" : clientLast);
+
+        StringBuilder query = new StringBuilder("?last=").append(encode(backendLast));
+        if (pageSize > 0) {
+            query.append("&n=").append((long) pageSize + 1);
+        }
+        URI target = URI.create("http://" + backendEndpoint + "/" + V2 + CATALOG + query);
+        try {
+            HttpRequest.Builder outgoing = HttpRequest.newBuilder(target)
+                    .timeout(Duration.ofMinutes(5))
+                    .method(request.method(), HttpRequest.BodyPublishers.noBody());
+            forwardRequestHeaders(request, outgoing);
+            HttpResponse<byte[]> backend =
+                    httpClient.send(outgoing.build(), HttpResponse.BodyHandlers.ofByteArray());
+            if (backend.statusCode() != 200) {
+                return response(backend, registryName, backend.body(), false);
+            }
+
+            List<String> repositories = ownRepositories(prefix, backend.body());
+            boolean more = pageSize > 0 && repositories.size() > pageSize;
+            if (more) {
+                repositories = repositories.subList(0, pageSize);
+            }
+            Response.ResponseBuilder page = Response.ok(catalogBody(repositories))
+                    .type(MediaType.APPLICATION_JSON);
+            if (more) {
+                page.header("Link", nextLink(repositories.get(repositories.size() - 1), pageSize));
+            }
+            return page.build();
+        } catch (Exception e) {
+            LOG.warnv("ACR catalog request to {0} failed: {1}", target, e.getMessage());
+            return AcrErrors.error(502, AcrErrors.UNAVAILABLE,
+                    "the registry data plane is unavailable: " + e.getMessage());
+        }
+    }
+
+    /** The catalog response body. An unserialisable list is reported as an empty catalog. */
+    private static byte[] catalogBody(List<String> repositories) {
+        try {
+            return MAPPER.writeValueAsBytes(Map.of("repositories", repositories));
+        } catch (Exception e) {
+            LOG.debugv("Could not write the registry catalog: {0}", e.getMessage());
+            return "{\"repositories\":[]}".getBytes(StandardCharsets.UTF_8);
+        }
+    }
+
+    /** The first value of a query parameter, or {@code null} when the client sent none. */
+    private static String firstQueryValue(AzureRequest request, String name) {
+        Map<String, List<String>> parameters = request.queryParamsMulti();
+        if (parameters == null) {
+            return null;
+        }
+        List<String> values = parameters.get(name);
+        return values == null || values.isEmpty() ? null : values.get(0);
     }
 
     /**

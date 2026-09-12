@@ -146,17 +146,9 @@ class AcrRegistryProxyHttpTest {
     }
 
     @Test
-    void catalogReportsOnlyThisRegistrysRepositories() throws Exception {
-        HttpServer registry = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        registry.createContext("/", exchange -> {
-            byte[] body = "{\"repositories\":[\"myreg/app\",\"otherreg/app\"]}"
-                    .getBytes(StandardCharsets.UTF_8);
-            exchange.getResponseHeaders().add("Content-Type", "application/json");
-            exchange.sendResponseHeaders(200, body.length);
-            exchange.getResponseBody().write(body);
-            exchange.close();
-        });
-        registry.start();
+    void catalogReportsOnlyThisRegistrysRepositories() {
+        AtomicReference<String> receivedQuery = new AtomicReference<>();
+        HttpServer registry = catalogServer(receivedQuery, "myreg/app", "otherreg/app");
 
         try {
             Response response = proxy(request("GET", "v2/_catalog", null, Map.of()),
@@ -164,9 +156,107 @@ class AcrRegistryProxyHttpTest {
 
             assertEquals(200, response.getStatus());
             assertEquals("{\"repositories\":[\"app\"]}", new String((byte[]) response.getEntity()));
+            // Unpaginated: seeded at the head of our block, with no page size and so no next link.
+            assertEquals("last=myreg%2F", receivedQuery.get());
+            assertNull(response.getHeaderString("Link"));
         } finally {
             registry.stop(0);
         }
+    }
+
+    @Test
+    void catalogSeedsTheCursorAtThisRegistrysBlockAndAsksForOneExtra() {
+        // The seed makes the container count our repositories rather than everyone's, so a page
+        // comes back full. The extra one is what tells us whether a next page exists.
+        AtomicReference<String> receivedQuery = new AtomicReference<>();
+        HttpServer registry = catalogServer(receivedQuery, "myreg/app", "myreg/web", "myreg/zebra");
+
+        try {
+            Response response = proxy(request("GET", "v2/_catalog", null, Map.of(),
+                    Map.of("n", List.of("2"))), registry.getAddress().getPort());
+
+            assertEquals(200, response.getStatus());
+            assertEquals("last=myreg%2F&n=3", receivedQuery.get());
+            assertEquals("{\"repositories\":[\"app\",\"web\"]}", new String((byte[]) response.getEntity()));
+            assertEquals("</v2/_catalog?last=web&n=2>; rel=\"next\"", response.getHeaderString("Link"));
+        } finally {
+            registry.stop(0);
+        }
+    }
+
+    @Test
+    void catalogPrefixesTheCursorTheClientSendsBack() {
+        AtomicReference<String> receivedQuery = new AtomicReference<>();
+        HttpServer registry = catalogServer(receivedQuery, "myreg/zebra", "otherreg/db");
+
+        try {
+            Response response = proxy(request("GET", "v2/_catalog", null, Map.of(),
+                            Map.of("n", List.of("2"), "last", List.of("web"))),
+                    registry.getAddress().getPort());
+
+            assertEquals(200, response.getStatus());
+            assertEquals("last=myreg%2Fweb&n=3", receivedQuery.get());
+            // The block ends inside this page, so it is the last one and carries no next link.
+            assertEquals("{\"repositories\":[\"zebra\"]}", new String((byte[]) response.getEntity()));
+            assertNull(response.getHeaderString("Link"));
+        } finally {
+            registry.stop(0);
+        }
+    }
+
+    @Test
+    void catalogEndsThePageWhenTheExtraRepositoryIsOutsideThisRegistry() {
+        // The container advertises a next page whenever the page it returned was full, so its own
+        // Link cannot say whether we have more. The extra repository can, and it does not leak.
+        AtomicReference<String> receivedQuery = new AtomicReference<>();
+        HttpServer registry = catalogServer(receivedQuery, "myreg/app", "myreg/web", "otherreg/db");
+
+        try {
+            Response response = proxy(request("GET", "v2/_catalog", null, Map.of(),
+                    Map.of("n", List.of("2"))), registry.getAddress().getPort());
+
+            assertEquals("{\"repositories\":[\"app\",\"web\"]}", new String((byte[]) response.getEntity()));
+            assertNull(response.getHeaderString("Link"));
+        } finally {
+            registry.stop(0);
+        }
+    }
+
+    @Test
+    void catalogNeverForwardsTheBackendsOwnNextLink() {
+        AtomicReference<String> receivedQuery = new AtomicReference<>();
+        HttpServer registry = server(exchange -> {
+            receivedQuery.set(exchange.getRequestURI().getRawQuery());
+            byte[] body = "{\"repositories\":[\"myreg/app\"]}".getBytes(StandardCharsets.UTF_8);
+            // The backend cursor names the internal repository and must never reach the client.
+            exchange.getResponseHeaders().add("Link", "</v2/_catalog?last=myreg%2Fapp&n=1>; rel=\"next\"");
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+
+        try {
+            Response response = proxy(request("GET", "v2/_catalog", null, Map.of()),
+                    registry.getAddress().getPort());
+
+            assertNull(response.getHeaderString("Link"));
+        } finally {
+            registry.stop(0);
+        }
+    }
+
+    /** A stand-in catalog answering every request with {@code repositories}, recording its query. */
+    private static HttpServer catalogServer(AtomicReference<String> receivedQuery, String... repositories) {
+        String names = String.join(",", List.of(repositories).stream().map(r -> "\"" + r + "\"").toList());
+        byte[] body = ("{\"repositories\":[" + names + "]}").getBytes(StandardCharsets.UTF_8);
+        return server(exchange -> {
+            receivedQuery.set(exchange.getRequestURI().getRawQuery());
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
     }
 
     @Test

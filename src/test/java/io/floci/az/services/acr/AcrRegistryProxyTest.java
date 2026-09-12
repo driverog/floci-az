@@ -4,6 +4,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -56,12 +57,54 @@ class AcrRegistryProxyTest {
 
     @Test
     void catalogShowsOnlyThisRegistrysRepositoriesWithoutThePrefix() {
-        byte[] shared = ("{\"repositories\":[\"myreg/app\",\"myreg/team/api\",\"otherreg/app\"]}")
+        byte[] shared = ("{\"repositories\":[\"myreg/app\",\"myreg/team/api\"]}")
                 .getBytes(StandardCharsets.UTF_8);
 
-        String filtered = new String(AcrRegistryProxy.filterCatalog("myreg", shared), StandardCharsets.UTF_8);
+        assertEquals(List.of("app", "team/api"), AcrRegistryProxy.ownRepositories("myreg/", shared));
+    }
 
-        assertEquals("{\"repositories\":[\"app\",\"team/api\"]}", filtered);
+    @Test
+    void catalogStopsReadingAtTheFirstRepositoryOutsideThisRegistry() {
+        // The container walks a directory tree, so a registry's repositories are a contiguous
+        // subtree. The first outsider ends the block and nothing of ours follows it, which is what
+        // lets one page be answered by one backend request.
+        byte[] shared = ("{\"repositories\":[\"myreg/app\",\"myreg/web\",\"myreg-1/app\","
+                + "\"myreg0/x\",\"otherreg/db\"]}").getBytes(StandardCharsets.UTF_8);
+
+        assertEquals(List.of("app", "web"), AcrRegistryProxy.ownRepositories("myreg/", shared));
+    }
+
+    @Test
+    void catalogStopsAtTheBlockEdgeRatherThanSkippingPastIt() {
+        // A real container cannot produce this, because the block is a subtree. Stopping rather
+        // than skipping is what makes that an invariant: collecting across a gap would count
+        // repositories the page size did not account for and mint a cursor that skips the gap.
+        byte[] shared = ("{\"repositories\":[\"myreg/app\",\"otherreg/db\",\"myreg/web\"]}")
+                .getBytes(StandardCharsets.UTF_8);
+
+        assertEquals(List.of("app"), AcrRegistryProxy.ownRepositories("myreg/", shared));
+    }
+
+    @Test
+    void catalogReadsNothingWhenTheBlockHasNotStarted() {
+        byte[] shared = "{\"repositories\":[\"otherreg/db\"]}".getBytes(StandardCharsets.UTF_8);
+
+        assertEquals(List.of(), AcrRegistryProxy.ownRepositories("myreg/", shared));
+    }
+
+    @Test
+    void aPageSizeIsReadOnlyWhenTheClientAskedForOne() {
+        assertEquals(0, AcrRegistryProxy.pageSize(null));
+        assertEquals(0, AcrRegistryProxy.pageSize(""));
+        assertEquals(0, AcrRegistryProxy.pageSize("not-a-number"));
+        assertEquals(0, AcrRegistryProxy.pageSize("-4"));
+        assertEquals(10, AcrRegistryProxy.pageSize(" 10 "));
+    }
+
+    @Test
+    void theNextLinkCarriesAnUnprefixedCursorInTheRegistrysOwnShape() {
+        assertEquals("</v2/_catalog?last=team%2Fapi&n=2>; rel=\"next\"",
+                AcrRegistryProxy.nextLink("team/api", 2));
     }
 
     @Test
@@ -69,23 +112,23 @@ class AcrRegistryProxyTest {
         byte[] backend = "{\"name\":\"myreg/team/api\",\"tags\":[\"v1\"]}".getBytes(StandardCharsets.UTF_8);
 
         assertEquals("{\"name\":\"team/api\",\"tags\":[\"v1\"]}",
-                new String(AcrRegistryProxy.rewriteBody("myreg", "v2/team/api/tags/list", backend),
+                new String(AcrRegistryProxy.unprefixRepositoryName("myreg", backend),
                         StandardCharsets.UTF_8));
     }
 
     @Test
     void onlyBodiesThatNameRepositoriesAreRewritten() {
-        assertTrue(AcrRegistryProxy.rewritesBody("v2/_catalog"));
+        // The catalog is not among them: it is built from the container's answer rather than
+        // rewritten in place, because it is also paginated.
+        assertFalse(AcrRegistryProxy.rewritesBody("v2/_catalog"));
         assertTrue(AcrRegistryProxy.rewritesBody("v2/app/tags/list"));
         assertFalse(AcrRegistryProxy.rewritesBody("v2/app/manifests/v1"));
         assertFalse(AcrRegistryProxy.rewritesBody("v2/app/blobs/sha256:abc"));
     }
 
     @Test
-    void catalogPassesThroughUnchangedWhenTheBodyIsNotTheExpectedShape() {
-        byte[] notJson = "<html/>".getBytes(StandardCharsets.UTF_8);
-
-        assertEquals("<html/>",
-                new String(AcrRegistryProxy.filterCatalog("myreg", notJson), StandardCharsets.UTF_8));
+    void catalogReadsNothingWhenTheBodyIsNotTheExpectedShape() {
+        assertEquals(List.of(),
+                AcrRegistryProxy.ownRepositories("myreg/", "<html/>".getBytes(StandardCharsets.UTF_8)));
     }
 }
