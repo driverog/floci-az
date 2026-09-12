@@ -138,6 +138,25 @@ public class AcrTokenEndpointsTest {
     }
 
     @Test
+    void aMalformedFormBodyIsAMalformedRequestNotAServerError() {
+        // "%zz" is not a percent escape. The parameter is treated as absent, so both endpoints
+        // answer their own 400 in the registry error shape rather than failing to parse.
+        given().header("Host", LOGIN_SERVER)
+                .contentType(FORM)
+                .body("grant_type=access_token&service=%zz")
+                .when().post("/oauth2/exchange")
+                .then().statusCode(400)
+                .body("errors[0].code", is("UNSUPPORTED"));
+
+        given().header("Host", LOGIN_SERVER)
+                .contentType(FORM)
+                .body("grant_type=refresh_token&refresh_token=" + REFRESH_TOKEN + "&service=%zz")
+                .when().post("/oauth2/token")
+                .then().statusCode(400)
+                .body("errors[0].code", is("UNSUPPORTED"));
+    }
+
+    @Test
     void exchangeAcceptsPostOnly() {
         given().header("Host", LOGIN_SERVER)
                 .when().get("/oauth2/exchange")

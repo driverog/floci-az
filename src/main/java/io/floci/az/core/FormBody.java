@@ -17,7 +17,14 @@ public final class FormBody {
     private FormBody() {
     }
 
-    /** Decoded form parameters; an unreadable or empty body yields an empty map. */
+    /**
+     * Decoded form parameters; an unreadable or empty body yields an empty map.
+     *
+     * <p>A pair that will not decode is dropped rather than thrown: a malformed percent escape is
+     * client input, and the endpoints answer a parameter that did not arrive with their own
+     * documented error. Letting {@link URLDecoder} throw here would escape the handler instead,
+     * because nothing on the dispatch path catches it, and a 500 would replace that error.</p>
+     */
     public static Map<String, String> parse(InputStream body) {
         Map<String, String> result = new HashMap<>();
         byte[] bytes;
@@ -35,9 +42,13 @@ public final class FormBody {
             if (eq < 0) {
                 continue;
             }
-            String key = URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8);
-            String value = URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8);
-            result.put(key, value);
+            try {
+                String key = URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8);
+                String value = URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8);
+                result.put(key, value);
+            } catch (IllegalArgumentException e) {
+                // A malformed escape such as "%zz"; the parameter is treated as absent.
+            }
         }
         return result;
     }
